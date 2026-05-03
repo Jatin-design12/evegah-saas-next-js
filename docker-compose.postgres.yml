@@ -1,0 +1,17 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: evegah-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: evegah
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./Backend/db/init:/docker-entrypoint-initdb.d:ro
+
+volumes:
+  pgdata:

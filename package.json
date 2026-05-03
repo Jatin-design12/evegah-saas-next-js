@@ -1,0 +1,32 @@
+{
+  "name": "evegah-rider-main",
+  "private": true,
+  "version": "1.0.0",
+  "scripts": {
+    "dev": "npm run dev:full",
+    "dev:frontend": "npm --prefix Frontend run dev",
+    "dev:backend": "npm --prefix Backend run dev",
+    "dev:full": "concurrently -n frontend,backend -c auto \"npm run dev:frontend\" \"npm run dev:backend\"",
+    "build": "npm run build:frontend && npm run build:backend",
+    "build:frontend": "npm --prefix Frontend run build",
+    "build:backend": "npm --prefix Backend run check",
+    "init:db": "npm --prefix Backend run init:db"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1"
+  },
+  "description": "This repository is separated into two apps.",
+  "main": "index.js",
+  "dependencies": {
+    "@aws-sdk/client-bedrock-runtime": "^3.1041.0",
+    "chalk": "^4.1.2",
+    "rxjs": "^7.8.2",
+    "shell-quote": "^1.8.3",
+    "tree-kill": "^1.2.2",
+    "yargs": "^17.7.2"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs"
+}

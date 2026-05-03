@@ -1,0 +1,225 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ===============================
+   GLOBAL BASE
+================================ */
+body {
+  @apply bg-[#f7f8fc] text-evegah-text;
+  font-family: "Inter", "Segoe UI", Roboto, system-ui, -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif;
+}
+
+#root {
+  min-height: 100vh;
+}
+
+/* ===============================
+   CUSTOM ANIMATIONS
+================================ */
+.animation-delay-2000 {
+  animation-delay: 2s;
+}
+
+.animation-delay-4000 {
+  animation-delay: 4s;
+}
+
+/* ===============================
+   TYPOGRAPHY
+================================ */
+h1 {
+  @apply text-3xl font-bold tracking-tight;
+}
+
+h2 {
+  @apply text-2xl font-semibold tracking-tight;
+}
+
+h3 {
+  @apply text-xl font-semibold tracking-tight;
+}
+
+h4 {
+  @apply text-lg font-medium;
+}
+
+p {
+  @apply text-base text-evegah-muted leading-relaxed;
+}
+
+.text-small {
+  @apply text-xs font-medium;
+}
+
+.text-medium {
+  @apply text-sm font-medium;
+}
+
+.text-normal {
+  @apply text-base font-normal;
+}
+
+.text-large {
+  @apply text-lg font-medium;
+}
+
+.text-xlarge {
+  @apply text-xl font-semibold;
+}
+
+.text-2xlarge {
+  @apply text-2xl font-bold;
+}
+
+.text-3xlarge {
+  @apply text-3xl font-bold;
+}
+
+/* ===============================
+   FORM ELEMENTS
+================================ */
+.label {
+  @apply text-sm font-medium text-evegah-text mb-1 block;
+}
+
+.input {
+  @apply w-full rounded-xl border border-slate-200
+         bg-white px-4 py-2.5 text-sm text-slate-700
+         transition-all duration-200
+         focus:outline-none focus:ring-2 focus:ring-violet-200
+         focus:border-violet-400;
+}
+
+.textarea {
+  @apply w-full rounded-xl border border-slate-200
+         bg-white px-4 py-2.5 text-sm text-slate-700 resize-none
+         transition-all duration-200
+         focus:outline-none focus:ring-2 focus:ring-violet-200
+         focus:border-violet-400;
+}
+
+.select {
+  @apply w-full rounded-xl border border-slate-200
+         bg-white px-4 py-2.5 text-sm text-slate-700
+         transition-all duration-200
+         focus:outline-none focus:ring-2 focus:ring-violet-200
+         focus:border-violet-400;
+}
+
+/* CHECKBOX / RADIO */
+.checkbox {
+  @apply accent-violet-600;
+}
+
+.radio {
+  @apply accent-emerald-600;
+}
+
+input[type="checkbox"] {
+  accent-color: #4f46e5;
+}
+
+input[type="radio"] {
+  accent-color: #16a34a;
+}
+
+input[type="file"] {
+  @apply w-full rounded-xl border border-slate-200 bg-white p-2 text-sm text-slate-700;
+}
+
+input[type="file"]::file-selector-button {
+  @apply mr-3 rounded-lg border border-violet-200 bg-violet-50 px-3 py-1.5 text-xs font-semibold text-violet-700;
+}
+
+/* ===============================
+   BUTTONS
+================================ */
+.btn-primary {
+  @apply bg-evegah-primary text-white px-6 py-2 rounded-xl text-sm 
+         hover:opacity-90 transition;
+}
+
+.btn-outline {
+  @apply border border-evegah-primary text-evegah-primary 
+         px-6 py-2 rounded-xl text-sm 
+         hover:bg-evegah-primary hover:text-white transition;
+}
+
+.btn-muted {
+  @apply bg-gray-100 text-evegah-text px-6 py-2 rounded-xl text-sm 
+         hover:bg-gray-200 transition;
+}
+
+/* ===============================
+   CARD / CONTAINER
+================================ */
+.card {
+  @apply bg-evegah-card rounded-2xl border border-evegah-border 
+         shadow-card p-6;
+}
+
+.ui-surface {
+  @apply rounded-2xl border border-slate-200 bg-white shadow-sm;
+}
+
+.ui-table th {
+  @apply text-xs font-bold uppercase tracking-wide text-slate-500;
+}
+
+.ui-table td {
+  @apply text-sm text-slate-700;
+}
+
+/* ===============================
+   ERROR / WARNING / INFO
+================================ */
+.error {
+  @apply text-xs text-red-500 mt-1;
+}
+
+.warning {
+  @apply text-xs text-yellow-600 mt-1;
+}
+
+.info {
+  @apply text-xs text-blue-600 mt-1;
+}
+
+/* ===============================
+   STEP PROGRESS BAR
+================================ */
+.progress-container {
+  @apply w-full h-2 bg-gray-200 rounded-full overflow-hidden;
+}
+
+.progress-bar {
+  @apply h-full bg-evegah-primary transition-all;
+}
+
+/* ===============================
+   UTILITY HELPERS
+================================ */
+.divider {
+  @apply border-t border-evegah-border my-6;
+}
+
+.section {
+  @apply space-y-4;
+}
+
+/* ===============================
+   ADMIN COMPACT VIEW
+   Makes 100% browser zoom look like ~90%
+================================ */
+.admin-viewport {
+  zoom: 0.9;
+}
+
+@supports not (zoom: 1) {
+  .admin-viewport {
+    transform: scale(0.9);
+    transform-origin: top left;
+    width: 111.111%;
+  }
+}

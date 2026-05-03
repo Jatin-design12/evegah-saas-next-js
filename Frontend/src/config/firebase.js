@@ -1,0 +1,41 @@
+// src/config/firebase.js
+import { initializeApp } from "firebase/app";
+import { browserLocalPersistence, getAuth, setPersistence } from "firebase/auth";
+import { ENV } from "./env";
+
+const firebaseConfig = {
+  apiKey: ENV.FIREBASE_API_KEY,
+  authDomain: ENV.FIREBASE_AUTH_DOMAIN,
+  projectId: ENV.FIREBASE_PROJECT_ID,
+  storageBucket: ENV.FIREBASE_STORAGE_BUCKET,
+  messagingSenderId: ENV.FIREBASE_MESSAGING_SENDER_ID,
+  appId: ENV.FIREBASE_APP_ID,
+};
+
+const requiredFirebaseKeys = [
+  "apiKey",
+  "authDomain",
+  "projectId",
+  "storageBucket",
+  "messagingSenderId",
+  "appId",
+];
+
+const missingFirebaseKeys = requiredFirebaseKeys.filter(
+  (key) => !String(firebaseConfig[key] || "").trim()
+);
+
+if (missingFirebaseKeys.length) {
+  throw new Error(
+    `Missing Firebase web config: ${missingFirebaseKeys.join(", ")}. Set NEXT_PUBLIC_FIREBASE_* values in Frontend/.env.local and restart Next.js.`
+  );
+}
+
+const app = initializeApp(firebaseConfig);
+export const auth = getAuth(app);
+
+// Keep Firebase auth across reloads/tabs (best-effort; may be restricted in some environments).
+setPersistence(auth, browserLocalPersistence).catch(() => {
+  // Ignore persistence errors (e.g., browser restrictions).
+});
+export default app;

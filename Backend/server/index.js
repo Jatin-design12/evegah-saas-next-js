@@ -1,0 +1,10413 @@
+/* eslint-env node */
+
+import express from "express";
+import cors from "cors";
+import dotenv from "dotenv";
+import { Pool } from "pg";
+import path from "path";
+import { fileURLToPath } from "url";
+import fs from "fs";
+import crypto from "crypto";
+import dns from "dns";
+import https from "https";
+import admin from "firebase-admin";
+import multer from "multer";
+import PDFDocument from "pdfkit";
+import {
+  buildIciciEncryptedRequest,
+  decryptIciciAsymmetricPayload,
+  encryptIciciAsymmetricPayload,
+  getIciciCryptoStatus,
+} from "./iciciCrypto.js";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+let admZipCtor = null;
+let admZipLoadError = null;
+
+async function getAdmZipCtor() {
+  if (admZipCtor) return admZipCtor;
+  if (admZipLoadError) throw admZipLoadError;
+  try {
+    const mod = await import("adm-zip");
+    admZipCtor = mod?.default || mod;
+    return admZipCtor;
+  } catch (error) {
+    admZipLoadError = error;
+    throw error;
+  }
+}
+
+// Prefer server/.env so local DB config stays with the API.
+// Use override so a globally-set DATABASE_URL doesn't silently take precedence.
+// Allow local overrides in server/.env.local (not committed) for dev.
+dotenv.config({ path: path.join(__dirname, ".env"), override: true });
+dotenv.config({ path: path.join(__dirname, ".env.local"), override: true });
+
+// Prefer IPv4 first to avoid environments where IPv6 routes/DNS cause intermittent fetch failures.
+// Safe no-op on older Node versions.
+try {
+  if (typeof dns.setDefaultResultOrder === "function") {
+    dns.setDefaultResultOrder(String(process.env.DNS_RESULT_ORDER || "ipv4first"));
+  }
+} catch {
+  // ignore
+}
+
+const app = express();
+app.use(
+  cors({
+    origin: true,
+    credentials: true,
+    allowedHeaders: ["Content-Type", "Authorization"],
+  })
+);
+app.use(
+  express.json({
+    limit: "15mb",
+    verify: (req, _res, buf) => {
+      // Preserve raw body for webhook signature verification.
+      // Safe for other routes; the buffer is already in memory.
+      req.rawBody = buf;
+    },
+  })
+);
+
+const port = Number(process.env.PORT || 5050);
+
+function buildDatabaseUrlFromParts() {
+  const host = String(process.env.POSTGRE_HOST || process.env.PGHOST || "").trim();
+  const portPart = String(process.env.POSTGRE_PORT || process.env.PGPORT || "5432").trim();
+  const dbName = String(
+    process.env.POSTGRE_DATABASE || process.env.POSTGRE_DATBASE || process.env.PGDATABASE || ""
+  ).trim();
+  const user = String(process.env.POSTGRE_USER || process.env.PGUSER || "").trim();
+  const password = String(process.env.POSTGRE_PASSWORD || process.env.PGPASSWORD || "");
+
+  if (!host || !dbName || !user) return "";
+
+  const encodedUser = encodeURIComponent(user);
+  const encodedPass = encodeURIComponent(password);
+  const auth = password ? `${encodedUser}:${encodedPass}` : encodedUser;
+  return `postgresql://${auth}@${host}:${portPart}/${dbName}`;
+}
+
+const databaseUrl = String(process.env.DATABASE_URL || "").trim() || buildDatabaseUrlFromParts();
+const dbConnectionTimeoutMs = Math.max(
+  250,
+  Number(process.env.timeout || process.env.DB_TIMEOUT_MS || process.env.PG_TIMEOUT_MS || 1000) || 1000
+);
+
+const whatsappPhoneNumberId = String(
+  process.env.WHATSAPP_PHONE_NUMBER_ID || "982622404928198"
+).trim();
+const whatsappAccessToken = String(process.env.WHATSAPP_CLOUD_ACCESS_TOKEN || "").trim();
+const whatsappWebhookVerifyToken = String(process.env.WHATSAPP_WEBHOOK_VERIFY_TOKEN || "").trim();
+const whatsappAppSecret = String(process.env.WHATSAPP_APP_SECRET || "").trim();
+const fetchApi = typeof globalThis.fetch === "function" ? globalThis.fetch.bind(globalThis) : null;
+const geocodeUserAgent =
+  String(process.env.GEOCODE_USER_AGENT || "evegah-fleet-admin/1.0").trim() ||
+  "evegah-fleet-admin/1.0";
+const geocodeTimeoutMs = Math.max(3000, Number(process.env.GEOCODE_TIMEOUT_MS || 9000) || 9000);
+
+const iciciMid = String(process.env.ICICI_MID || "").trim();
+const iciciVpa = String(process.env.ICICI_VPA || "").trim();
+const iciciApiKey = String(process.env.ICICI_API_KEY || "").trim();
+const iciciBaseUrl = String(process.env.ICICI_BASE_URL || "").trim();
+const iotSnapshotBaseUrl = String(process.env.IOT_SNAPSHOT_BASE_URL || process.env.IOT_BACKEND_BASE_URL || "").trim();
+const iciciQrEndpoint = String(process.env.ICICI_QR_ENDPOINT || "").trim();
+const iciciTransactionStatusEndpoint = String(process.env.ICICI_TRANSACTION_STATUS_ENDPOINT || "").trim();
+const iciciCallbackStatusEndpoint = String(process.env.ICICI_CALLBACK_STATUS_ENDPOINT || "").trim();
+const iciciRefundEndpoint = String(process.env.ICICI_REFUND_ENDPOINT || "").trim();
+
+// Public (no-auth) config for frontend convenience.
+// Used by getPublicConfig() in src/config/api.js
+app.get("/api/config", (_req, res) => {
+  const upiId = String(process.env.EVEGAH_UPI_ID || process.env.ICICI_VPA || "").trim();
+  const payeeName = String(process.env.EVEGAH_PAYEE_NAME || process.env.ICICI_PAYEE_NAME || "Evegah").trim();
+  res.json({ upiId: upiId || null, payeeName: payeeName || "Evegah" });
+});
+
+function tryParseJson(text) {
+  const s = String(text || "").trim();
+  if (!s) return null;
+  if (!(s.startsWith("{") || s.startsWith("["))) return null;
+  try {
+    return JSON.parse(s);
+  } catch {
+    return null;
+  }
+}
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function describeFetchCause(err) {
+  const cause = err?.cause;
+  if (!cause) return "";
+  const parts = [];
+  if (cause.code) parts.push(`code=${cause.code}`);
+  if (cause.errno) parts.push(`errno=${cause.errno}`);
+  if (cause.syscall) parts.push(`syscall=${cause.syscall}`);
+  if (cause.address) parts.push(`address=${cause.address}`);
+  if (cause.port) parts.push(`port=${cause.port}`);
+  const msg = String(cause.message || "").trim();
+  if (msg && !parts.includes(msg)) parts.push(`causeMessage=${msg}`);
+  return parts.length ? parts.join(" ") : "";
+}
+
+function isRetryableNetworkError(err) {
+  const msg = String(err?.message || "").toLowerCase();
+  const causeCode = String(err?.cause?.code || "").toUpperCase();
+  if (msg.includes("timeout") || msg.includes("fetch failed")) return true;
+  return new Set([
+    "ECONNRESET",
+    "ETIMEDOUT",
+    "ESOCKETTIMEDOUT",
+    "EAI_AGAIN",
+    "ENOTFOUND",
+    "ECONNREFUSED",
+    "UND_ERR_CONNECT_TIMEOUT",
+    "UND_ERR_SOCKET",
+    "UND_ERR_HEADERS_TIMEOUT",
+    "UND_ERR_BODY_TIMEOUT",
+  ]).has(causeCode);
+}
+
+async function fetchWithRetry(url, options, { timeoutMs = 15000, retries = 1 } = {}) {
+  if (!fetchApi) {
+    const err = new Error("Node fetch API unavailable");
+    err.status = 503;
+    throw err;
+  }
+
+  let lastError = null;
+  for (let attempt = 0; attempt <= retries; attempt += 1) {
+    const controller = typeof AbortController !== "undefined" ? new AbortController() : null;
+    const timeout = controller
+      ? setTimeout(() => controller.abort(), Math.max(1000, Number(timeoutMs) || 15000))
+      : null;
+
+    try {
+      const res = await fetchApi(url, {
+        ...options,
+        ...(controller ? { signal: controller.signal } : {}),
+      });
+      return res;
+    } catch (e) {
+      lastError = e;
+      const detail = describeFetchCause(e);
+      const augmented = new Error(detail ? `${String(e?.message || e)} (${detail})` : String(e?.message || e));
+      augmented.cause = e;
+      // Retry only for transient network errors.
+      if (attempt < retries && isRetryableNetworkError(e)) {
+        await sleep(400 * (attempt + 1));
+        continue;
+      }
+      throw augmented;
+    } finally {
+      if (timeout) clearTimeout(timeout);
+    }
+  }
+  throw lastError || new Error("fetch failed");
+}
+
+async function httpsRequestOnce({ url, method, headers, body, timeoutMs, ipOverride }) {
+  const u = new URL(url);
+  if (u.protocol !== "https:") {
+    throw new Error(`Only https: supported for ipOverride (${u.protocol})`);
+  }
+
+  const hostname = u.hostname;
+  const port = u.port ? Number(u.port) : 443;
+  const pathWithQuery = `${u.pathname}${u.search || ""}`;
+
+  return new Promise((resolve, reject) => {
+    const req = https.request(
+      {
+        protocol: "https:",
+        host: ipOverride || hostname,
+        port,
+        method,
+        path: pathWithQuery,
+        headers: {
+          // Preserve the original host header for virtual hosting.
+          Host: hostname,
+          ...headers,
+        },
+        // Ensure SNI uses the DigiLocker hostname even if we connect to a raw IP.
+        servername: hostname,
+      },
+      (res) => {
+        const chunks = [];
+        res.on("data", (c) => chunks.push(c));
+        res.on("end", () => {
+          const text = Buffer.concat(chunks).toString("utf8");
+          resolve({
+            ok: res.statusCode >= 200 && res.statusCode < 300,
+            status: res.statusCode || 0,
+            headers: res.headers || {},
+            text,
+          });
+        });
+      }
+    );
+
+    const effectiveTimeoutMs = Math.max(1000, Number(timeoutMs) || 15000);
+    req.setTimeout(effectiveTimeoutMs, () => {
+      req.destroy(new Error(`timeout after ${effectiveTimeoutMs}ms`));
+    });
+    req.on("error", reject);
+
+    if (body !== undefined && body !== null) req.write(body);
+    req.end();
+  });
+}
+
+async function tryHttpsAcrossResolvedIps({ url, method, headers, body, timeoutMs }) {
+  const u = new URL(url);
+  const hostname = u.hostname;
+  // Only do this for DigiLocker hostnames; avoid surprising behavior elsewhere.
+  const allow = hostname === "api.digitallocker.gov.in" || hostname.endsWith(".digitallocker.gov.in");
+  if (!allow) throw new Error("tryHttpsAcrossResolvedIps called for non-DigiLocker host");
+
+  let ips = [];
+  try {
+    // resolve4 is best here because the observed issue is on a specific IPv4.
+    ips = await dns.promises.resolve4(hostname);
+  } catch (e) {
+    const err = new Error(`DNS resolve4 failed for ${hostname}: ${String(e?.message || e)}`);
+    err.cause = e;
+    throw err;
+  }
+
+  if (!Array.isArray(ips) || ips.length === 0) {
+    throw new Error(`No A records for ${hostname}`);
+  }
+
+  // Deterministic-ish shuffle so we don't always hit the same bad IP first.
+  const rotated = (() => {
+    const start = Math.floor(Date.now() / 1000) % ips.length;
+    return [...ips.slice(start), ...ips.slice(0, start)];
+  })();
+
+  let lastErr = null;
+  for (const ip of rotated) {
+    try {
+      const res = await httpsRequestOnce({ url, method, headers, body, timeoutMs, ipOverride: ip });
+      // If we got an HTTP response at all, return it even if it's 4xx.
+      return { ...res, ip };
+    } catch (e) {
+      lastErr = e;
+      // Only skip to next IP for retryable network errors; otherwise fail fast.
+      if (!isRetryableNetworkError(e)) break;
+    }
+  }
+  const err = new Error(`All DigiLocker IPs failed: ${String(lastErr?.message || lastErr || "fetch failed")}`);
+  err.cause = lastErr;
+  throw err;
+}
+
+function looksLikeBase64(text) {
+  const s = String(text || "").trim();
+  if (!s || s.length < 24) return false;
+  if (s.length % 4 !== 0) return false;
+  return /^[A-Za-z0-9+/=\s]+$/.test(s);
+}
+
+function decodeIciciAsymmetricResponseOrThrow(rawText) {
+  // ICICI docs say response is encrypted Base64(RSA(...)), but some environments return JSON.
+  const asJson = tryParseJson(rawText);
+  if (asJson !== null) return asJson;
+
+  const trimmed = String(rawText || "").trim();
+  if (!trimmed) return "";
+
+  // Only attempt decrypt if it looks like encrypted base64.
+  if (!looksLikeBase64(trimmed)) return trimmed;
+
+  const cryptoStatus = getIciciCryptoStatus();
+  if (!cryptoStatus.hasPrivateKey) {
+    const err = new Error(
+      "ICICI response looks encrypted. Configure ICICI_CLIENT_PRIVATE_KEY_P12_PATH (and passphrase) to decrypt response."
+    );
+    err.code = "ICICI_PRIVATE_KEY_REQUIRED";
+    throw err;
+  }
+
+  return decryptIciciAsymmetricPayload(trimmed);
+}
+
+const ADMIN_EMAIL = String(process.env.ADMIN_EMAIL || "adminev@gmail.com").trim().toLowerCase();
+
+if (!databaseUrl) {
+  // Keep the server running to show a clear error on requests.
+  console.warn("Missing DATABASE_URL in environment");
+}
+
+const pool = new Pool({
+  connectionString: databaseUrl,
+  connectionTimeoutMillis: dbConnectionTimeoutMs,
+});
+
+async function ensureDbInitialized() {
+  if (!databaseUrl) return;
+  const auto = String(process.env.AUTO_MIGRATE ?? "true").toLowerCase();
+  if (auto === "false" || auto === "0" || auto === "no") return;
+
+  try {
+    const check = await pool.query(
+      "select to_regclass('public.riders') as riders_table, to_regclass('public.battery_swaps') as battery_swaps_table"
+    );
+    const ridersOk = Boolean(check.rows?.[0]?.riders_table);
+    const batterySwapsOk = Boolean(check.rows?.[0]?.battery_swaps_table);
+    if (ridersOk && batterySwapsOk) return;
+
+    const initDir = path.resolve(__dirname, "..", "db", "init");
+    if (!fs.existsSync(initDir)) {
+      console.warn("DB init skipped: db/init folder not found:", initDir);
+      return;
+    }
+
+    const files = (await fs.promises.readdir(initDir))
+      .filter((f) => f.toLowerCase().endsWith(".sql"))
+      .sort();
+
+    if (files.length === 0) {
+      console.warn("DB init skipped: no .sql files found in", initDir);
+      return;
+    }
+
+    console.log("DB schema missing; applying db/init migrations...", files);
+    for (const f of files) {
+      const sql = await fs.promises.readFile(path.join(initDir, f), "utf8");
+      if (!sql.trim()) continue;
+      await pool.query(sql);
+    }
+    console.log("DB init complete.");
+  } catch (error) {
+    console.warn(
+      "DB init failed (check DATABASE_URL / permissions):",
+      String(error?.message || error)
+    );
+  }
+}
+
+const uploadsDir = path.join(__dirname, "uploads");
+if (!fs.existsSync(uploadsDir)) {
+  fs.mkdirSync(uploadsDir, { recursive: true });
+}
+app.use("/uploads", express.static(uploadsDir));
+app.use("/api/uploads", express.static(uploadsDir));
+
+const upload = multer({
+  storage: multer.diskStorage({
+    destination: (_req, _file, cb) => cb(null, uploadsDir),
+    filename: (_req, file, cb) => {
+      const safeBase = String(file.originalname || "upload")
+        .replace(/[^a-z0-9._-]+/gi, "-")
+        .slice(0, 80);
+      const ext = path.extname(safeBase) || "";
+      const name = `${Date.now()}-${Math.random().toString(16).slice(2)}${ext}`;
+      cb(null, name);
+    },
+  }),
+  limits: { fileSize: 10 * 1024 * 1024 },
+});
+
+app.post("/api/uploads/image", upload.single("photo"), (req, res) => {
+  const file = req.file;
+  if (!file) {
+    return res.status(400).json({ error: "photo file is required" });
+  }
+
+  return res.status(201).json({
+    url: `/uploads/${file.filename}`,
+    file_name: file.filename,
+    original_name: file.originalname,
+    mime_type: file.mimetype,
+    size_bytes: file.size,
+  });
+});
+
+function toDigits(value, maxLen) {
+  return String(value || "")
+    .replace(/\D/g, "")
+    .slice(0, maxLen);
+}
+
+function safeEqual(a, b) {
+  const aa = Buffer.from(String(a || ""), "utf8");
+  const bb = Buffer.from(String(b || ""), "utf8");
+  if (aa.length !== bb.length) return false;
+  return crypto.timingSafeEqual(aa, bb);
+}
+
+// Keep a small in-memory log of webhook events to debug delivery.
+const whatsappWebhookEvents = [];
+const WHATSAPP_WEBHOOK_EVENTS_MAX = 200;
+
+function pushWhatsAppWebhookEvent(event) {
+  whatsappWebhookEvents.push({
+    at: new Date().toISOString(),
+    ...event,
+  });
+  if (whatsappWebhookEvents.length > WHATSAPP_WEBHOOK_EVENTS_MAX) {
+    whatsappWebhookEvents.splice(0, whatsappWebhookEvents.length - WHATSAPP_WEBHOOK_EVENTS_MAX);
+  }
+}
+
+// ------------------------------
+// WhatsApp Cloud API Webhook
+// ------------------------------
+// Configure in Meta Developer Dashboard:
+// Callback URL: https://<your-domain>/api/webhooks/whatsapp
+// Verify token: WHATSAPP_WEBHOOK_VERIFY_TOKEN
+function handleWhatsAppWebhookVerify(req, res) {
+  const mode = String(req.query["hub.mode"] || "");
+  const token = String(req.query["hub.verify_token"] || "");
+  const challenge = String(req.query["hub.challenge"] || "");
+
+  if (mode === "subscribe" && whatsappWebhookVerifyToken && token === whatsappWebhookVerifyToken) {
+    return res.status(200).send(challenge);
+  }
+
+  return res.sendStatus(403);
+}
+
+function handleWhatsAppWebhookReceive(req, res) {
+  try {
+    // Optional verification (recommended). If you don't set WHATSAPP_APP_SECRET, we accept the webhook.
+    if (whatsappAppSecret) {
+      const signatureHeader = String(req.get("x-hub-signature-256") || "");
+      const provided = signatureHeader.startsWith("sha256=") ? signatureHeader.slice("sha256=".length) : "";
+      const rawBody = req.rawBody instanceof Buffer ? req.rawBody : Buffer.from(JSON.stringify(req.body || {}));
+      const expected = crypto.createHmac("sha256", whatsappAppSecret).update(rawBody).digest("hex");
+      if (!provided || !safeEqual(provided, expected)) {
+        return res.sendStatus(403);
+      }
+    }
+
+    // WhatsApp webhook payloads come under entry[].changes[].value
+    const entry = Array.isArray(req.body?.entry) ? req.body.entry : [];
+    for (const e of entry) {
+      const changes = Array.isArray(e?.changes) ? e.changes : [];
+      for (const c of changes) {
+        const value = c?.value || {};
+        const statuses = Array.isArray(value?.statuses) ? value.statuses : [];
+        const messages = Array.isArray(value?.messages) ? value.messages : [];
+
+        if (statuses.length) {
+          // This is what you need to debug “sent but not received” cases.
+          pushWhatsAppWebhookEvent({ type: "statuses", statuses });
+          console.log("WhatsApp webhook statuses", JSON.stringify(statuses));
+        }
+        if (messages.length) {
+          pushWhatsAppWebhookEvent({ type: "messages", messages });
+          console.log("WhatsApp webhook messages", JSON.stringify(messages));
+        }
+      }
+    }
+
+    return res.sendStatus(200);
+  } catch (error) {
+    console.error("WhatsApp webhook handler failed", error);
+    return res.sendStatus(200);
+  }
+}
+
+// Primary endpoint
+app.get("/api/webhooks/whatsapp", handleWhatsAppWebhookVerify);
+app.post("/api/webhooks/whatsapp", handleWhatsAppWebhookReceive);
+
+// Alias endpoint (matches Meta quickstart screenshots some users follow)
+app.get("/api/whatsapp/webhook", handleWhatsAppWebhookVerify);
+app.post("/api/whatsapp/webhook", handleWhatsAppWebhookReceive);
+
+// Debug endpoint to inspect recent webhook events (requires admin token)
+app.get("/api/whatsapp/webhook-events", requireAdmin, (_req, res) => {
+  return res.json({
+    count: whatsappWebhookEvents.length,
+    events: whatsappWebhookEvents.slice(-100),
+  });
+});
+
+function parseDataUrl(dataUrl) {
+  const s = String(dataUrl || "");
+  const match = s.match(/^data:([^;]+);base64,(.+)$/);
+  if (!match) return null;
+  return { mime: match[1], base64: match[2] };
+}
+
+function extFromMime(mime) {
+  const m = String(mime || "").toLowerCase();
+  if (m === "image/jpeg") return ".jpg";
+  if (m === "image/png") return ".png";
+  if (m === "image/webp") return ".webp";
+  if (m === "image/gif") return ".gif";
+  return "";
+}
+
+function safeFilePart(value, maxLen) {
+  // Keep filenames URL-friendly and filesystem-safe.
+  // Convert spaces/symbols to '-', collapse repeats, and trim.
+  return String(value || "")
+    .trim()
+    .replace(/\s+/g, "-")
+    .replace(/[^a-z0-9._-]+/gi, "-")
+    .replace(/-+/g, "-")
+    .replace(/^[-._]+|[-._]+$/g, "")
+    .slice(0, maxLen);
+}
+
+function formatYyyyMm(date) {
+  const d = date instanceof Date ? date : new Date();
+  const yyyy = String(d.getFullYear());
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  return `${yyyy}${mm}`;
+}
+
+function randomReadableCode(len = 6) {
+  // Excludes ambiguous chars: 0,O,1,I
+  const alphabet = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
+  let out = "";
+  for (let i = 0; i < len; i += 1) {
+    out += alphabet[Math.floor(Math.random() * alphabet.length)];
+  }
+  return out;
+}
+
+function makeRiderCode(now = new Date()) {
+  // Example: RDR-202512-K8Q2MZ
+  return `RDR-${formatYyyyMm(now)}-${randomReadableCode(6)}`;
+}
+
+async function ensureRiderCode({ client, riderId }) {
+  const existingQ = await client.query(
+    `select coalesce(meta->>'rider_code','') as rider_code
+     from public.riders
+     where id = $1`,
+    [riderId]
+  );
+  const existing = String(existingQ.rows?.[0]?.rider_code || "").trim();
+  if (existing) return existing;
+
+  // Try a few times to avoid collisions.
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    const candidate = makeRiderCode(new Date());
+    const dupe = await client.query(
+      `select 1
+       from public.riders
+       where meta->>'rider_code' = $1
+       limit 1`,
+      [candidate]
+    );
+    if (dupe.rowCount) continue;
+
+    const updated = await client.query(
+      `update public.riders
+       set meta = coalesce(meta, '{}'::jsonb) || jsonb_build_object('rider_code', $1::text)
+       where id = $2
+       returning coalesce(meta->>'rider_code','') as rider_code`,
+      [candidate, riderId]
+    );
+    const value = String(updated.rows?.[0]?.rider_code || "").trim();
+    if (value) return value;
+  }
+
+  throw new Error("Unable to allocate unique rider code");
+}
+
+function normalizeZone(value) {
+  const raw = String(value || "").trim().toLowerCase();
+  if (!raw) return "";
+  const cleaned = raw.replace(/\bzone\b/g, "").replace(/\s+/g, " ").trim();
+
+  if (cleaned.includes("gotri")) return "Gotri";
+  if (cleaned.includes("manjalpur")) return "Manjalpur";
+  if (cleaned.includes("karelibaug")) return "Karelibaug";
+  if (cleaned.includes("daman")) return "Daman";
+  if (cleaned.includes("aatapi") || cleaned.includes("atapi")) return "Aatapi";
+  if (cleaned.includes("waghodiya")) return "Waghodiya";
+  if (cleaned.includes("ajwa")) return "Ajwa Road";
+  if (cleaned.includes("chhani")) return "Chhani";
+  if (cleaned.includes("anand")) return "Anand";
+  if (cleaned.includes("bengaluru") || cleaned.includes("bangalore")) return "Bengaluru";
+
+  return cleaned
+    .split(" ")
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
+}
+
+function normalizeZoneKey(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "")
+    .trim();
+}
+
+function normalizeIdForCompare(value) {
+  return String(value || "")
+    .replace(/[^a-z0-9]+/gi, "")
+    .toUpperCase();
+}
+
+const DEFAULT_SHARED_BATTERY_ID = "DEFAULT";
+const AVAILABILITY_RESET_SINGLETON = true;
+
+let availabilityResetTableReady = false;
+let zoneManagementTableReady = false;
+let fleetManagementTablesReady = false;
+
+function normalizeAdminIdentity(value) {
+  return String(value || "").trim();
+}
+
+async function ensureAvailabilityResetTable({ client }) {
+  if (availabilityResetTableReady) return;
+
+  await client.query(
+    `create table if not exists public.availability_resets (
+       singleton boolean primary key default true,
+       reset_at timestamptz not null default now(),
+       reset_by_uid text,
+       reset_by_email text,
+       reason text,
+       updated_at timestamptz not null default now()
+     )`
+  );
+
+  await client.query(
+    `insert into public.availability_resets (singleton, reset_at, reason)
+     values ($1, to_timestamp(0), 'initial')
+     on conflict (singleton) do nothing`,
+    [AVAILABILITY_RESET_SINGLETON]
+  );
+
+  availabilityResetTableReady = true;
+}
+
+async function getAvailabilityResetAt({ client }) {
+  await ensureAvailabilityResetTable({ client });
+
+  const q = await client.query(
+    `select reset_at
+     from public.availability_resets
+     where singleton = $1
+     limit 1`,
+    [AVAILABILITY_RESET_SINGLETON]
+  );
+
+  const raw = q.rows?.[0]?.reset_at;
+  if (!raw) return null;
+
+  const parsed = new Date(raw);
+  if (Number.isNaN(parsed.getTime())) return null;
+  return parsed.toISOString();
+}
+
+async function resetAvailabilityCheckpoint({ client, resetByUid = "", resetByEmail = "", reason = "" }) {
+  await ensureAvailabilityResetTable({ client });
+
+  const q = await client.query(
+    `insert into public.availability_resets (singleton, reset_at, reset_by_uid, reset_by_email, reason, updated_at)
+     values ($1, now(), nullif($2::text, ''), nullif($3::text, ''), nullif($4::text, ''), now())
+     on conflict (singleton) do update
+       set reset_at = excluded.reset_at,
+           reset_by_uid = excluded.reset_by_uid,
+           reset_by_email = excluded.reset_by_email,
+           reason = excluded.reason,
+           updated_at = now()
+     returning reset_at`,
+    [
+      AVAILABILITY_RESET_SINGLETON,
+      normalizeAdminIdentity(resetByUid),
+      normalizeAdminIdentity(resetByEmail).toLowerCase(),
+      normalizeAdminIdentity(reason),
+    ]
+  );
+
+  const raw = q.rows?.[0]?.reset_at;
+  const parsed = raw ? new Date(raw) : null;
+  return parsed && !Number.isNaN(parsed.getTime()) ? parsed.toISOString() : new Date().toISOString();
+}
+
+function normalizeZoneCode(value) {
+  return String(value || "")
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z0-9-]+/g, "");
+}
+
+function normalizeZoneColor(value) {
+  const color = String(value || "").trim();
+  return /^#([0-9a-f]{6})$/i.test(color) ? color.toUpperCase() : "#10B981";
+}
+
+function parseOptionalZoneNumber(value, { min = null, max = null, decimals = null } = {}) {
+  if (value === undefined || value === null) return null;
+  const s = String(value).trim();
+  if (!s) return null;
+  const n = Number(s);
+  if (!Number.isFinite(n)) return null;
+
+  let out = n;
+  if (min !== null) out = Math.max(min, out);
+  if (max !== null) out = Math.min(max, out);
+  if (Number.isInteger(decimals) && decimals >= 0) {
+    out = Number(out.toFixed(decimals));
+  }
+  return out;
+}
+
+async function ensureZoneManagementTable({ client }) {
+  if (zoneManagementTableReady) return;
+
+  await client.query(
+    `create table if not exists public.zone_management (
+       id bigserial primary key,
+       zone_name text not null,
+       zone_code text not null unique,
+       country text not null default 'India',
+       state text,
+       city text,
+       area text,
+       radius_km numeric(8,2) not null default 1,
+       latitude numeric(10,6),
+       longitude numeric(10,6),
+       color text not null default '#10B981',
+       is_active boolean not null default true,
+       staff_count int not null default 0,
+       created_at timestamptz not null default now(),
+       updated_at timestamptz not null default now()
+     )`
+  );
+
+  await client.query(
+    `create index if not exists zone_management_zone_name_idx
+       on public.zone_management (lower(zone_name))`
+  );
+
+  await client.query(
+    `create index if not exists zone_management_zone_code_idx
+       on public.zone_management (lower(zone_code))`
+  );
+
+  await client.query(
+    `alter table public.zone_management
+     add column if not exists area text`
+  );
+
+  await client.query(
+    `update public.zone_management
+     set area = coalesce(nullif(trim(zone_name), ''), area)
+     where coalesce(nullif(trim(area), ''), '') = ''`
+  );
+
+  const countQ = await client.query(`select count(*)::int as count from public.zone_management`);
+  const count = Number(countQ.rows?.[0]?.count || 0);
+
+  if (count === 0) {
+    const defaults = [
+      {
+        zoneName: "Gotri",
+        zoneCode: "GTR",
+        country: "India",
+        state: "GJ",
+        city: "Vadodara",
+        area: "Gotri",
+        radiusKm: 5,
+        latitude: 22.3217,
+        longitude: 73.1851,
+        color: "#10B981",
+        staffCount: 5,
+      },
+      {
+        zoneName: "Manjalpur",
+        zoneCode: "MJP",
+        country: "India",
+        state: "GJ",
+        city: "Vadodara",
+        area: "Manjalpur",
+        radiusKm: 4,
+        latitude: 22.2671,
+        longitude: 73.1945,
+        color: "#3B82F6",
+        staffCount: 3,
+      },
+      {
+        zoneName: "Karelibaug",
+        zoneCode: "KRB",
+        country: "India",
+        state: "GJ",
+        city: "Vadodara",
+        area: "Karelibaug",
+        radiusKm: 3,
+        latitude: 22.312,
+        longitude: 73.2048,
+        color: "#8B5CF6",
+        staffCount: 4,
+      },
+      {
+        zoneName: "Alkapuri",
+        zoneCode: "AKP",
+        country: "India",
+        state: "GJ",
+        city: "Vadodara",
+        area: "Alkapuri",
+        radiusKm: 5,
+        latitude: 22.3098,
+        longitude: 73.1728,
+        color: "#F59E0B",
+        staffCount: 2,
+      },
+      {
+        zoneName: "Waghodiya",
+        zoneCode: "WGD",
+        country: "India",
+        state: "GJ",
+        city: "Vadodara",
+        area: "Waghodiya",
+        radiusKm: 6,
+        latitude: 22.332,
+        longitude: 73.248,
+        color: "#EF4444",
+        staffCount: 3,
+      },
+      {
+        zoneName: "Daman",
+        zoneCode: "DMN",
+        country: "India",
+        state: "DNHDD",
+        city: "Daman",
+        area: "Daman",
+        radiusKm: 7,
+        latitude: 20.4147,
+        longitude: 72.832,
+        color: "#06B6D4",
+        staffCount: 6,
+      },
+    ];
+
+    for (const zone of defaults) {
+      await client.query(
+        `insert into public.zone_management
+           (zone_name, zone_code, country, state, city, area, radius_km, latitude, longitude, color, is_active, staff_count)
+         values
+           ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,true,$11)
+         on conflict (zone_code) do nothing`,
+        [
+          zone.zoneName,
+          zone.zoneCode,
+          zone.country,
+          zone.state,
+          zone.city,
+          zone.area,
+          zone.radiusKm,
+          zone.latitude,
+          zone.longitude,
+          zone.color,
+          zone.staffCount,
+        ]
+      );
+    }
+  }
+
+  zoneManagementTableReady = true;
+}
+
+function cleanLocationName(value) {
+  return String(value || "")
+    .trim()
+    .replace(/\s+/g, " ");
+}
+
+function locationCodeFromName(value, fallbackPrefix = "LOC") {
+  const cleaned = cleanLocationName(value)
+    .toUpperCase()
+    .replace(/[^A-Z0-9]+/g, "")
+    .slice(0, 8);
+  if (cleaned) return cleaned;
+  return String(fallbackPrefix || "LOC")
+    .toUpperCase()
+    .replace(/[^A-Z0-9]+/g, "")
+    .slice(0, 8) || "LOC";
+}
+
+async function geocodeQueryByText(queryText) {
+  const query = cleanLocationName(queryText || "");
+  if (!query || !fetchApi) return null;
+
+  const endpoint = new URL("https://nominatim.openstreetmap.org/search");
+  endpoint.searchParams.set("format", "jsonv2");
+  endpoint.searchParams.set("limit", "1");
+  endpoint.searchParams.set("q", query);
+
+  try {
+    const response = await fetchWithRetry(
+      endpoint.toString(),
+      {
+        method: "GET",
+        headers: {
+          Accept: "application/json",
+          "User-Agent": geocodeUserAgent,
+        },
+      },
+      { timeoutMs: geocodeTimeoutMs, retries: 1 }
+    );
+
+    if (!response?.ok) return null;
+
+    const payload = await response.json().catch(() => null);
+    const first = Array.isArray(payload) ? payload[0] : null;
+    if (!first) return null;
+
+    const latitude = parseOptionalZoneNumber(first.lat, { min: -90, max: 90, decimals: 6 });
+    const longitude = parseOptionalZoneNumber(first.lon, { min: -180, max: 180, decimals: 6 });
+
+    if (latitude === null || longitude === null) return null;
+
+    return {
+      latitude,
+      longitude,
+      display_name: cleanLocationName(first.display_name || "") || null,
+    };
+  } catch (error) {
+    console.warn("City geocode lookup failed:", String(error?.message || error));
+    return null;
+  }
+}
+
+async function geocodeCityCoordinates({ cityName, stateName = "", countryName = "" }) {
+  const city = cleanLocationName(cityName || "");
+  if (!city) return null;
+
+  const candidates = [
+    [city, cleanLocationName(stateName || ""), cleanLocationName(countryName || "")]
+      .filter(Boolean)
+      .join(", "),
+    [city, cleanLocationName(countryName || "")].filter(Boolean).join(", "),
+    city,
+  ];
+
+  const seen = new Set();
+  for (const candidate of candidates) {
+    if (!candidate || seen.has(candidate)) continue;
+    seen.add(candidate);
+    const geocoded = await geocodeQueryByText(candidate);
+    if (geocoded) return geocoded;
+  }
+
+  return null;
+}
+
+async function geocodeAreaCoordinates({ areaName, cityName = "", stateName = "", countryName = "" }) {
+  const area = cleanLocationName(areaName || "");
+  if (!area) return null;
+
+  const candidates = [
+    [
+      area,
+      cleanLocationName(cityName || ""),
+      cleanLocationName(stateName || ""),
+      cleanLocationName(countryName || ""),
+    ]
+      .filter(Boolean)
+      .join(", "),
+    [area, cleanLocationName(cityName || ""), cleanLocationName(countryName || "")]
+      .filter(Boolean)
+      .join(", "),
+    [area, cleanLocationName(cityName || "")].filter(Boolean).join(", "),
+    area,
+  ];
+
+  const seen = new Set();
+  for (const candidate of candidates) {
+    if (!candidate || seen.has(candidate)) continue;
+    seen.add(candidate);
+    const geocoded = await geocodeQueryByText(candidate);
+    if (geocoded) return geocoded;
+  }
+
+  return null;
+}
+
+function normalizeVehicleStatus(value) {
+  const allowed = new Set(["available", "in_use", "maintenance", "inactive"]);
+  const normalized = String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, "_");
+  return allowed.has(normalized) ? normalized : "available";
+}
+
+function normalizeBatteryStatus(value) {
+  const allowed = new Set(["available", "in_use", "charging", "maintenance", "inactive"]);
+  const normalized = String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, "_");
+  return allowed.has(normalized) ? normalized : "available";
+}
+
+async function ensureFleetManagementTables({ client }) {
+  if (fleetManagementTablesReady) return;
+
+  await ensureZoneManagementTable({ client });
+
+  await client.query(
+    `create table if not exists public.fleet_countries (
+       id bigserial primary key,
+       country_name text not null unique,
+       country_code text not null unique,
+       is_active boolean not null default true,
+       created_at timestamptz not null default now(),
+       updated_at timestamptz not null default now()
+     )`
+  );
+
+  await client.query(
+    `create table if not exists public.fleet_states (
+       id bigserial primary key,
+       country_code text not null,
+       state_name text not null,
+       state_code text not null,
+       is_active boolean not null default true,
+       created_at timestamptz not null default now(),
+       updated_at timestamptz not null default now(),
+       unique (country_code, state_code),
+       unique (country_code, state_name)
+     )`
+  );
+
+  await client.query(
+    `create table if not exists public.fleet_cities (
+       id bigserial primary key,
+       country_code text not null,
+       state_code text not null,
+       city_name text not null,
+       latitude numeric(10,6),
+       longitude numeric(10,6),
+       is_active boolean not null default true,
+       created_at timestamptz not null default now(),
+       updated_at timestamptz not null default now(),
+       unique (country_code, state_code, city_name)
+     )`
+  );
+
+  await client.query(
+    `create table if not exists public.fleet_areas (
+       id bigserial primary key,
+       country_code text not null,
+       state_code text not null,
+       city_name text not null,
+       area_name text not null,
+       latitude numeric(10,6),
+       longitude numeric(10,6),
+       is_active boolean not null default true,
+       created_at timestamptz not null default now(),
+       updated_at timestamptz not null default now(),
+       unique (country_code, state_code, city_name, area_name)
+     )`
+  );
+
+  await client.query(
+    `alter table public.fleet_cities
+     add column if not exists latitude numeric(10,6)`
+  );
+
+  await client.query(
+    `alter table public.fleet_cities
+     add column if not exists longitude numeric(10,6)`
+  );
+
+  await client.query(
+    `alter table public.fleet_areas
+     add column if not exists latitude numeric(10,6)`
+  );
+
+  await client.query(
+    `alter table public.fleet_areas
+     add column if not exists longitude numeric(10,6)`
+  );
+
+  await client.query(
+    `create table if not exists public.fleet_vehicles (
+       id bigserial primary key,
+       vehicle_id text not null unique,
+       vehicle_type text,
+       model text,
+       zone_id bigint references public.zone_management(id) on delete set null,
+       assigned_battery_id bigint,
+       status text not null default 'available',
+       notes text,
+       created_at timestamptz not null default now(),
+       updated_at timestamptz not null default now()
+     )`
+  );
+
+  await client.query(
+    `create table if not exists public.fleet_batteries (
+       id bigserial primary key,
+       battery_id text not null unique,
+       battery_type text,
+       zone_id bigint references public.zone_management(id) on delete set null,
+       assigned_vehicle_id bigint,
+       health_percent int not null default 100,
+       status text not null default 'available',
+       notes text,
+       created_at timestamptz not null default now(),
+       updated_at timestamptz not null default now()
+     )`
+  );
+
+  await client.query(
+    `create index if not exists fleet_vehicles_zone_idx on public.fleet_vehicles(zone_id)`
+  );
+  await client.query(
+    `create index if not exists fleet_batteries_zone_idx on public.fleet_batteries(zone_id)`
+  );
+  await client.query(
+    `create index if not exists fleet_areas_city_idx
+       on public.fleet_areas(country_code, state_code, lower(city_name), lower(area_name))`
+  );
+
+  const countriesCountQ = await client.query(`select count(*)::int as count from public.fleet_countries`);
+  const statesCountQ = await client.query(`select count(*)::int as count from public.fleet_states`);
+  const citiesCountQ = await client.query(`select count(*)::int as count from public.fleet_cities`);
+
+  if (Number(countriesCountQ.rows?.[0]?.count || 0) === 0) {
+    await client.query(
+      `insert into public.fleet_countries (country_name, country_code, is_active)
+       values
+         ('India', 'IN', true)
+       on conflict (country_code) do nothing`
+    );
+  }
+
+  if (Number(statesCountQ.rows?.[0]?.count || 0) === 0) {
+    await client.query(
+      `insert into public.fleet_states (country_code, state_name, state_code, is_active)
+       values
+         ('IN', 'Gujarat', 'GJ', true),
+         ('IN', 'Maharashtra', 'MH', true),
+         ('IN', 'Delhi', 'DL', true),
+         ('IN', 'Dadra and Nagar Haveli and Daman and Diu', 'DNHDD', true)
+       on conflict (country_code, state_code) do nothing`
+    );
+  }
+
+  if (Number(citiesCountQ.rows?.[0]?.count || 0) === 0) {
+    await client.query(
+      `insert into public.fleet_cities (country_code, state_code, city_name, latitude, longitude, is_active)
+       values
+         ('IN', 'GJ', 'Vadodara', 22.307200, 73.181200, true),
+         ('IN', 'MH', 'Mumbai', 19.076000, 72.877700, true),
+         ('IN', 'DL', 'Delhi', 28.613900, 77.209000, true),
+         ('IN', 'DNHDD', 'Daman', 20.414700, 72.832000, true)
+       on conflict (country_code, state_code, city_name) do nothing`
+    );
+  }
+
+  const zoneRows = await client.query(
+    `select distinct country, state, city, area, latitude, longitude
+     from public.zone_management`
+  );
+
+  for (const row of zoneRows.rows || []) {
+    const countryName = cleanLocationName(row.country || "India") || "India";
+    const inferredCountryCode =
+      countryName.toLowerCase() === "india"
+        ? "IN"
+        : locationCodeFromName(countryName, "CTY").slice(0, 3);
+    await client.query(
+      `insert into public.fleet_countries (country_name, country_code, is_active)
+       values ($1,$2,true)
+       on conflict do nothing`,
+      [countryName, inferredCountryCode]
+    );
+
+    const countryQ = await client.query(
+      `select country_code
+       from public.fleet_countries
+       where lower(country_name) = lower($1)
+       limit 1`,
+      [countryName]
+    );
+    const countryCode = String(countryQ.rows?.[0]?.country_code || inferredCountryCode || "IN");
+
+    const stateName = cleanLocationName(row.state || "");
+    if (stateName) {
+      const inferredStateCode = locationCodeFromName(stateName, "ST");
+      await client.query(
+        `insert into public.fleet_states (country_code, state_name, state_code, is_active)
+         values ($1,$2,$3,true)
+         on conflict do nothing`,
+        [countryCode, stateName, inferredStateCode]
+      );
+
+      const stateQ = await client.query(
+        `select state_code
+         from public.fleet_states
+         where country_code = $1
+           and lower(state_name) = lower($2)
+         limit 1`,
+        [countryCode, stateName]
+      );
+
+      const stateCode = String(stateQ.rows?.[0]?.state_code || inferredStateCode || "").trim() || null;
+
+      const cityName = cleanLocationName(row.city || "");
+      if (cityName && stateCode) {
+        await client.query(
+          `insert into public.fleet_cities (country_code, state_code, city_name, is_active)
+           values ($1,$2,$3,true)
+           on conflict (country_code, state_code, city_name) do update
+             set is_active = true,
+                 updated_at = now()`,
+          [countryCode, stateCode, cityName]
+        );
+
+        const areaName = cleanLocationName(row.area || "");
+        if (areaName) {
+          const areaLatitude = parseOptionalZoneNumber(row.latitude, {
+            min: -90,
+            max: 90,
+            decimals: 6,
+          });
+          const areaLongitude = parseOptionalZoneNumber(row.longitude, {
+            min: -180,
+            max: 180,
+            decimals: 6,
+          });
+
+          await client.query(
+            `insert into public.fleet_areas
+               (country_code, state_code, city_name, area_name, latitude, longitude, is_active, updated_at)
+             values ($1,$2,$3,$4,$5,$6,true,now())
+             on conflict (country_code, state_code, city_name, area_name) do update
+               set latitude = coalesce(excluded.latitude, public.fleet_areas.latitude),
+                   longitude = coalesce(excluded.longitude, public.fleet_areas.longitude),
+                   is_active = true,
+                   updated_at = now()`,
+            [countryCode, stateCode, cityName, areaName, areaLatitude, areaLongitude]
+          );
+        }
+      }
+    }
+  }
+
+  fleetManagementTablesReady = true;
+}
+
+async function listLocationMasters({ client }) {
+  await ensureFleetManagementTables({ client });
+
+  const [countriesQ, statesQ, citiesQ, areasQ] = await Promise.all([
+    client.query(
+      `select id, country_name, country_code, is_active
+       from public.fleet_countries
+       order by lower(country_name) asc`
+    ),
+    client.query(
+      `select id, country_code, state_name, state_code, is_active
+       from public.fleet_states
+       order by lower(country_code) asc, lower(state_name) asc`
+    ),
+    client.query(
+      `select id, country_code, state_code, city_name, latitude, longitude, is_active
+       from public.fleet_cities
+       order by lower(country_code) asc, lower(state_code) asc, lower(city_name) asc`
+    ),
+    client.query(
+      `select id, country_code, state_code, city_name, area_name, latitude, longitude, is_active
+       from public.fleet_areas
+       order by lower(country_code) asc, lower(state_code) asc, lower(city_name) asc, lower(area_name) asc`
+    ),
+  ]);
+
+  return {
+    countries: (countriesQ.rows || []).map((row) => ({
+      id: Number(row.id),
+      country_name: row.country_name,
+      country_code: row.country_code,
+      is_active: Boolean(row.is_active),
+    })),
+    states: (statesQ.rows || []).map((row) => ({
+      id: Number(row.id),
+      country_code: row.country_code,
+      state_name: row.state_name,
+      state_code: row.state_code,
+      is_active: Boolean(row.is_active),
+    })),
+    cities: (citiesQ.rows || []).map((row) => ({
+      id: Number(row.id),
+      country_code: row.country_code,
+      state_code: row.state_code,
+      city_name: row.city_name,
+      latitude: row.latitude === null ? null : Number(row.latitude),
+      longitude: row.longitude === null ? null : Number(row.longitude),
+      is_active: Boolean(row.is_active),
+    })),
+    areas: (areasQ.rows || []).map((row) => ({
+      id: Number(row.id),
+      country_code: row.country_code,
+      state_code: row.state_code,
+      city_name: row.city_name,
+      area_name: row.area_name,
+      latitude: row.latitude === null ? null : Number(row.latitude),
+      longitude: row.longitude === null ? null : Number(row.longitude),
+      is_active: Boolean(row.is_active),
+    })),
+  };
+}
+
+async function upsertLocationHierarchy({
+  client,
+  country,
+  state,
+  city,
+  area,
+  cityLatitude = null,
+  cityLongitude = null,
+  areaLatitude = null,
+  areaLongitude = null,
+}) {
+  await ensureFleetManagementTables({ client });
+
+  const countryName = cleanLocationName(country || "India") || "India";
+  const inferredCountryCode =
+    countryName.toLowerCase() === "india"
+      ? "IN"
+      : locationCodeFromName(countryName, "CTY").slice(0, 3);
+
+  await client.query(
+    `insert into public.fleet_countries (country_name, country_code, is_active)
+     values ($1,$2,true)
+     on conflict do nothing`,
+    [countryName, inferredCountryCode]
+  );
+
+  const countryQ = await client.query(
+    `select country_code
+     from public.fleet_countries
+     where lower(country_name) = lower($1)
+     limit 1`,
+    [countryName]
+  );
+
+  const countryCode = String(countryQ.rows?.[0]?.country_code || inferredCountryCode || "IN");
+
+  const stateName = cleanLocationName(state || "");
+  let stateCode = null;
+  if (stateName) {
+    stateCode = locationCodeFromName(stateName, "ST");
+    await client.query(
+      `insert into public.fleet_states (country_code, state_name, state_code, is_active)
+       values ($1,$2,$3,true)
+       on conflict do nothing`,
+      [countryCode, stateName, stateCode]
+    );
+
+    const stateQ = await client.query(
+      `select state_code
+       from public.fleet_states
+       where country_code = $1
+         and lower(state_name) = lower($2)
+       limit 1`,
+      [countryCode, stateName]
+    );
+    stateCode = String(stateQ.rows?.[0]?.state_code || stateCode || "").trim() || null;
+  }
+
+  const cityName = cleanLocationName(city || "");
+  const areaName = cleanLocationName(area || "");
+  let resolvedCityLatitude = null;
+  let resolvedCityLongitude = null;
+
+  if (cityName && stateCode) {
+    let latitude = parseOptionalZoneNumber(cityLatitude, {
+      min: -90,
+      max: 90,
+      decimals: 6,
+    });
+    let longitude = parseOptionalZoneNumber(cityLongitude, {
+      min: -180,
+      max: 180,
+      decimals: 6,
+    });
+
+    if (latitude === null || longitude === null) {
+      const existingCityQ = await client.query(
+        `select latitude, longitude
+         from public.fleet_cities
+         where country_code = $1
+           and state_code = $2
+           and lower(city_name) = lower($3)
+         limit 1`,
+        [countryCode, stateCode, cityName]
+      );
+
+      const existingLatitude = parseOptionalZoneNumber(existingCityQ.rows?.[0]?.latitude, {
+        min: -90,
+        max: 90,
+        decimals: 6,
+      });
+      const existingLongitude = parseOptionalZoneNumber(existingCityQ.rows?.[0]?.longitude, {
+        min: -180,
+        max: 180,
+        decimals: 6,
+      });
+
+      if (existingLatitude !== null && existingLongitude !== null) {
+        latitude = existingLatitude;
+        longitude = existingLongitude;
+      }
+    }
+
+    if (latitude === null || longitude === null) {
+      const geocoded = await geocodeCityCoordinates({
+        cityName,
+        stateName,
+        countryName,
+      });
+      if (geocoded) {
+        latitude = geocoded.latitude;
+        longitude = geocoded.longitude;
+      }
+    }
+
+    await client.query(
+      `insert into public.fleet_cities
+         (country_code, state_code, city_name, latitude, longitude, is_active, updated_at)
+       values
+         ($1,$2,$3,$4,$5,true,now())
+       on conflict (country_code, state_code, city_name) do update
+         set latitude = coalesce(excluded.latitude, public.fleet_cities.latitude),
+             longitude = coalesce(excluded.longitude, public.fleet_cities.longitude),
+             is_active = true,
+             updated_at = now()`,
+      [countryCode, stateCode, cityName, latitude, longitude]
+    );
+
+    const cityQ = await client.query(
+      `select latitude, longitude
+       from public.fleet_cities
+       where country_code = $1
+         and state_code = $2
+         and lower(city_name) = lower($3)
+       limit 1`,
+      [countryCode, stateCode, cityName]
+    );
+
+    resolvedCityLatitude = parseOptionalZoneNumber(cityQ.rows?.[0]?.latitude, {
+      min: -90,
+      max: 90,
+      decimals: 6,
+    });
+    resolvedCityLongitude = parseOptionalZoneNumber(cityQ.rows?.[0]?.longitude, {
+      min: -180,
+      max: 180,
+      decimals: 6,
+    });
+
+    if (areaName) {
+      const resolvedAreaLatitude =
+        parseOptionalZoneNumber(areaLatitude, {
+          min: -90,
+          max: 90,
+          decimals: 6,
+        }) ?? resolvedCityLatitude;
+      const resolvedAreaLongitude =
+        parseOptionalZoneNumber(areaLongitude, {
+          min: -180,
+          max: 180,
+          decimals: 6,
+        }) ?? resolvedCityLongitude;
+
+      await client.query(
+        `insert into public.fleet_areas
+           (country_code, state_code, city_name, area_name, latitude, longitude, is_active, updated_at)
+         values ($1,$2,$3,$4,$5,$6,true,now())
+         on conflict (country_code, state_code, city_name, area_name) do update
+           set latitude = coalesce(excluded.latitude, public.fleet_areas.latitude),
+               longitude = coalesce(excluded.longitude, public.fleet_areas.longitude),
+               is_active = true,
+               updated_at = now()`,
+        [
+          countryCode,
+          stateCode,
+          cityName,
+          areaName,
+          resolvedAreaLatitude,
+          resolvedAreaLongitude,
+        ]
+      );
+    }
+  }
+
+  return {
+    country: countryName,
+    state: stateName || null,
+    city: cityName || null,
+    area: areaName || null,
+    countryCode,
+    stateCode,
+    cityLatitude: resolvedCityLatitude,
+    cityLongitude: resolvedCityLongitude,
+  };
+}
+
+async function listZoneManagementRows({ client }) {
+  await ensureFleetManagementTables({ client });
+
+  const { rows } = await client.query(
+    `select
+       z.id,
+       z.zone_name,
+       z.zone_code,
+       z.country,
+       z.state,
+       z.city,
+       coalesce(z.area, z.zone_name) as area,
+       z.radius_km,
+       z.latitude,
+       z.longitude,
+       z.color,
+       z.is_active,
+       z.staff_count,
+       z.created_at,
+       z.updated_at,
+       coalesce(v.vehicles_count, 0)::int as vehicles_count,
+       coalesce(b.batteries_count, 0)::int as batteries_count,
+       coalesce(m.active_rides, 0)::int as active_rides,
+       coalesce(m.monthly_revenue, 0)::numeric as monthly_revenue
+     from public.zone_management z
+     left join lateral (
+       select count(*)::int as vehicles_count
+       from public.fleet_vehicles fv
+       where fv.zone_id = z.id
+     ) v on true
+     left join lateral (
+       select count(*)::int as batteries_count
+       from public.fleet_batteries fb
+       where fb.zone_id = z.id
+     ) b on true
+     left join lateral (
+       select
+         count(*) filter (
+           where not exists (
+             select 1
+             from public.returns ret
+             where ret.rental_id = r.id
+           )
+         )::int as active_rides,
+         coalesce(
+           sum(
+             case
+               when r.start_time >= (date_trunc('day', now()) - interval '29 day') then r.rental_amount
+               else 0
+             end
+           ),
+           0
+         )::numeric as monthly_revenue
+       from public.rentals r
+       where regexp_replace(lower(coalesce(r.meta->>'zone', '')), '[^a-z0-9]+', '', 'g') =
+             regexp_replace(lower(coalesce(z.zone_name, '')), '[^a-z0-9]+', '', 'g')
+     ) m on true
+     order by lower(z.zone_name) asc`
+  );
+
+  return (rows || []).map((row) => ({
+    id: Number(row.id),
+    zone_key: normalizeZoneKey(row.zone_name),
+    zone_name: row.zone_name,
+    zone_code: row.zone_code,
+    country: row.country,
+    state: row.state,
+    city: row.city,
+    area: row.area,
+    radius_km: Number(row.radius_km || 0),
+    latitude: row.latitude === null ? null : Number(row.latitude),
+    longitude: row.longitude === null ? null : Number(row.longitude),
+    color: row.color,
+    is_active: Boolean(row.is_active),
+    staff_count: Number(row.staff_count || 0),
+    vehicles_count: Number(row.vehicles_count || 0),
+    batteries_count: Number(row.batteries_count || 0),
+    active_rides: Number(row.active_rides || 0),
+    monthly_revenue: Number(row.monthly_revenue || 0),
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+  }));
+}
+
+function isSharedDefaultBatteryId(value) {
+  return normalizeIdForCompare(value) === DEFAULT_SHARED_BATTERY_ID;
+}
+
+async function getActiveAvailability({ client }) {
+  const resetAtIso = await getAvailabilityResetAt({ client }).catch((error) => {
+    console.warn("Failed to read availability reset checkpoint:", String(error?.message || error));
+    return null;
+  });
+
+  const q = await client.query(
+    `with active_rentals as (
+       select r.id as rental_id, r.start_time, r.bike_id, r.battery_id, r.vehicle_number
+       from public.rentals r
+       where not exists (select 1 from public.returns ret where ret.rental_id = r.id)
+         and ($1::timestamptz is null or r.start_time >= $1::timestamptz)
+     ),
+     active_with_current as (
+       select ar.rental_id,
+              ar.bike_id,
+              ar.vehicle_number,
+              coalesce(
+                (
+                  select s.battery_in
+                  from public.battery_swaps s
+                  where regexp_replace(lower(coalesce(s.vehicle_number,'')),'[^a-z0-9]+','','g') =
+                        regexp_replace(lower(coalesce(ar.vehicle_number,'')),'[^a-z0-9]+','','g')
+                    and s.swapped_at >= ar.start_time
+                  order by s.swapped_at desc, s.created_at desc
+                  limit 1
+                ),
+                ar.battery_id
+              ) as current_battery_id
+       from active_rentals ar
+     )
+     select
+       coalesce(array_agg(distinct bike_id) filter (where coalesce(bike_id,'') <> ''), '{}') as vehicle_ids,
+       coalesce(array_agg(distinct vehicle_number) filter (where coalesce(vehicle_number,'') <> ''), '{}') as vehicle_numbers,
+       coalesce(array_agg(distinct current_battery_id) filter (where coalesce(current_battery_id,'') <> ''), '{}') as battery_ids
+      from active_with_current`,
+     [resetAtIso]
+  );
+
+  const row = q.rows?.[0] || {};
+  const vehicleIds = Array.isArray(row.vehicle_ids) ? row.vehicle_ids : [];
+  const vehicleNumbers = Array.isArray(row.vehicle_numbers) ? row.vehicle_numbers : [];
+  const batteryIds = (Array.isArray(row.battery_ids) ? row.battery_ids : []).filter(
+    (id) => !isSharedDefaultBatteryId(id)
+  );
+
+  const vehicleIdSet = new Set(vehicleIds.map(normalizeIdForCompare).filter(Boolean));
+  const vehicleNumberSet = new Set(vehicleNumbers.map(normalizeIdForCompare).filter(Boolean));
+  const batteryIdSet = new Set(batteryIds.map(normalizeIdForCompare).filter(Boolean));
+
+  return {
+    unavailableVehicleIds: vehicleIds,
+    unavailableVehicleNumbers: vehicleNumbers,
+    unavailableBatteryIds: batteryIds,
+    unavailableVehicleIdSet: vehicleIdSet,
+    unavailableVehicleNumberSet: vehicleNumberSet,
+    unavailableBatteryIdSet: batteryIdSet,
+    availabilityResetAt: resetAtIso,
+  };
+}
+
+async function autoCreateBatterySwapForRental({ client, rental }) {
+  const vehicleNumber = String(rental?.vehicle_number || "").trim();
+  const batteryIn = String(rental?.battery_id || "").trim();
+  const swappedAt = rental?.start_time;
+
+  const meta = rental?.meta && typeof rental.meta === "object" ? rental.meta : {};
+  const employeeUid = String(meta.employee_uid || meta.employeeUid || "").trim() || "system";
+  const employeeEmail = String(meta.employee_email || meta.employeeEmail || "").trim() || null;
+
+  if (!vehicleNumber || !batteryIn || !swappedAt) return;
+
+  // Prevent duplicate auto swaps (same vehicle + same start time + same battery)
+  const dupe = await client.query(
+    `select 1
+     from public.battery_swaps
+     where regexp_replace(lower(coalesce(vehicle_number,'')),'[^a-z0-9]+','','g') =
+           regexp_replace(lower($1::text),'[^a-z0-9]+','','g')
+       and swapped_at = $2::timestamptz
+       and regexp_replace(lower(coalesce(battery_in,'')),'[^a-z0-9]+','','g') =
+           regexp_replace(lower($3::text),'[^a-z0-9]+','','g')
+     limit 1`,
+    [vehicleNumber, swappedAt, batteryIn]
+  );
+  if (dupe.rowCount) return;
+
+  const prev = await client.query(
+    `select battery_in
+     from public.battery_swaps
+     where regexp_replace(lower(coalesce(vehicle_number,'')),'[^a-z0-9]+','','g') =
+           regexp_replace(lower($1::text),'[^a-z0-9]+','','g')
+       and swapped_at < $2::timestamptz
+     order by swapped_at desc, created_at desc
+     limit 1`,
+    [vehicleNumber, swappedAt]
+  );
+  const previousBattery = String(prev.rows?.[0]?.battery_in || "").trim();
+  const batteryOut = previousBattery || "N/A";
+
+  await client.query(
+    `insert into public.battery_swaps
+       (employee_uid, employee_email, vehicle_number, battery_out, battery_in, swapped_at, notes)
+     values
+       ($1,$2,$3,$4,$5,$6,$7)`,
+    [
+      employeeUid,
+      employeeEmail,
+      vehicleNumber,
+      batteryOut,
+      batteryIn,
+      swappedAt,
+      "Auto: rental started",
+    ]
+  );
+}
+
+async function saveDataUrlToUploads({ dataUrl, fileNameHint }) {
+  const parsed = parseDataUrl(dataUrl);
+  if (!parsed) throw new Error("Invalid image data");
+
+  const ext = extFromMime(parsed.mime) || path.extname(String(fileNameHint || "")) || ".bin";
+  const fileName = `${Date.now()}-${Math.random().toString(16).slice(2)}${ext}`;
+  const absPath = path.join(uploadsDir, fileName);
+  const buffer = Buffer.from(parsed.base64, "base64");
+  await fs.promises.writeFile(absPath, buffer);
+
+  return {
+    url: `/uploads/${fileName}`,
+    file_name: fileName,
+    mime_type: parsed.mime,
+    size_bytes: buffer.length,
+  };
+}
+
+function isUuidLike(value) {
+  const s = String(value || "").trim();
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(s);
+}
+
+function toJsonObject(value, fallback = {}) {
+  if (value && typeof value === "object" && !Array.isArray(value)) return value;
+  if (typeof value === "string") {
+    try {
+      const parsed = JSON.parse(value);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed;
+    } catch {
+      // ignore
+    }
+  }
+  return fallback;
+}
+
+function toJsonArray(value) {
+  if (Array.isArray(value)) return value;
+  if (typeof value === "string") {
+    try {
+      const parsed = JSON.parse(value);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  }
+  return [];
+}
+
+function normalizeArchiveName(value, fallback = "rider") {
+  const s = safeFilePart(value, 120);
+  return s || safeFilePart(fallback, 120) || "rider";
+}
+
+function uploadsAbsPathFromUrl(url) {
+  const raw = String(url || "").trim();
+  if (!raw.startsWith("/uploads/")) return null;
+  const rel = raw.replace(/^\/uploads\//, "");
+  if (!rel || rel.includes("..") || path.isAbsolute(rel)) return null;
+  return path.join(uploadsDir, rel);
+}
+
+function inferMimeTypeFromExt(ext) {
+  const e = String(ext || "").toLowerCase();
+  if (e === ".jpg" || e === ".jpeg") return "image/jpeg";
+  if (e === ".png") return "image/png";
+  if (e === ".webp") return "image/webp";
+  if (e === ".gif") return "image/gif";
+  if (e === ".pdf") return "application/pdf";
+  return "application/octet-stream";
+}
+
+async function collectRiderProfileBundle(riderId) {
+  const riderQ = await pool.query(`select * from public.riders where id = $1`, [riderId]);
+  const rider = riderQ.rows?.[0] || null;
+  if (!rider) return null;
+
+  const rentalsQ = await pool.query(
+    `select *
+     from public.rentals
+     where rider_id = $1
+     order by start_time asc, created_at asc`,
+    [riderId]
+  );
+  const rentals = rentalsQ.rows || [];
+  const rentalIds = rentals.map((r) => String(r?.id || "")).filter(isUuidLike);
+
+  const returnsQ = rentalIds.length
+    ? await pool.query(
+      `select *
+       from public.returns
+       where rental_id = any($1::uuid[])
+       order by returned_at asc, created_at asc`,
+      [rentalIds]
+    )
+    : { rows: [] };
+
+  const docsQ = await pool.query(
+    `select distinct d.*
+     from public.documents d
+     where d.rider_id = $1
+        or d.rental_id in (select id from public.rentals where rider_id = $1)
+        or d.return_id in (
+          select rt.id
+          from public.returns rt
+          join public.rentals r on r.id = rt.rental_id
+          where r.rider_id = $1
+        )
+     order by d.created_at asc`,
+    [riderId]
+  );
+
+  const swapsQ = await pool.query(
+    `select s.id, s.created_at, s.swapped_at, s.employee_uid, s.employee_email,
+            s.vehicle_number, s.battery_out, s.battery_in, s.notes,
+            rr.rental_id, rr.rider_id
+     from public.battery_swaps s
+     join lateral (
+       select r.id as rental_id,
+              rd.id as rider_id
+       from public.rentals r
+       left join public.riders rd on rd.id = r.rider_id
+       left join lateral (
+         select max(returned_at) as returned_at
+         from public.returns rt
+         where rt.rental_id = r.id
+       ) ret on true
+       where regexp_replace(lower(coalesce(r.vehicle_number,'')),'[^a-z0-9]+','','g') =
+             regexp_replace(lower(coalesce(s.vehicle_number,'')),'[^a-z0-9]+','','g')
+         and r.start_time <= coalesce(s.swapped_at, s.created_at)
+         and (ret.returned_at is null or ret.returned_at > coalesce(s.swapped_at, s.created_at))
+       order by r.start_time desc
+       limit 1
+     ) rr on true
+     where rr.rider_id = $1
+     order by coalesce(s.swapped_at, s.created_at) asc`,
+    [riderId]
+  );
+
+  return {
+    rider,
+    rentals,
+    returns: returnsQ.rows || [],
+    documents: docsQ.rows || [],
+    battery_swaps: swapsQ.rows || [],
+  };
+}
+
+const profileArchiveUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 250 * 1024 * 1024 },
+});
+
+function createReceiptPdfBuffer({ formData, registration }) {
+  return new Promise((resolve, reject) => {
+    try {
+      const doc = new PDFDocument({ size: "A4", margin: 48 });
+      const chunks = [];
+      doc.on("data", (chunk) => chunks.push(chunk));
+      doc.on("end", () => resolve(Buffer.concat(chunks)));
+      doc.on("error", reject);
+
+      const now = new Date();
+      const rawReceiptNo = registration?.rentalId || registration?.riderId || "";
+      const receiptNo = (() => {
+        const s = String(rawReceiptNo || "").trim();
+        if (!s) return "";
+        const base = s.split("-")[0] || s;
+        if (base && base.length >= 6) return `EVEGAH-${base.toUpperCase()}`;
+        return s;
+      })();
+      const riderCode = registration?.riderCode || "";
+
+      const primary = "#1A574A";
+      const border = "#D2D2D2";
+      const pageWidth = doc.page.width;
+      const margin = doc.page.margins.left;
+      const contentWidth = pageWidth - doc.page.margins.left - doc.page.margins.right;
+
+      const logoCandidates = [
+        path.resolve(__dirname, "..", "assets", "logo.png"),
+        path.resolve(__dirname, "..", "src", "assets", "logo.png"),
+      ];
+      const logoPath = logoCandidates.find((candidate) => fs.existsSync(candidate)) || "";
+      const hasLogo = Boolean(logoPath);
+
+      // Header
+      const headerTop = doc.y;
+      if (hasLogo) {
+        try {
+          doc.image(logoPath, margin, headerTop, { width: 90 });
+        } catch {
+          // ignore
+        }
+      }
+
+      doc
+        .fillColor("#111")
+        .fontSize(18)
+        .text("Rider Registration", hasLogo ? margin + 100 : margin, headerTop, {
+          continued: false,
+        });
+      doc
+        .fillColor("#444")
+        .fontSize(13)
+        .text("Payment Receipt", hasLogo ? margin + 100 : margin, headerTop + 22);
+
+      doc
+        .fillColor("#555")
+        .fontSize(10)
+        .text(`Receipt No: ${receiptNo || "-"}`, margin, headerTop + 5, {
+          width: contentWidth,
+          align: "right",
+        })
+        .text(`Date: ${now.toLocaleString()}`, margin, headerTop + 20, {
+          width: contentWidth,
+          align: "right",
+        });
+
+      doc.moveDown(2);
+      doc
+        .rect(margin, doc.y, contentWidth, 10)
+        .fill(primary);
+      doc
+        .rect(margin, doc.y + 10, contentWidth, 3)
+        .fill("#E6F3EF");
+      doc.moveDown(2);
+
+      const drawSection = (title, lines) => {
+        doc
+          .fillColor(primary)
+          .rect(margin, doc.y, contentWidth, 16)
+          .fill();
+        doc
+          .fillColor("#fff")
+          .fontSize(11)
+          .text(title, margin + 10, doc.y + 4);
+        doc.moveDown(1.2);
+        const boxTop = doc.y;
+        doc
+          .rect(margin, boxTop, contentWidth, Math.max(24, lines.length * 14 + 10))
+          .strokeColor(border)
+          .lineWidth(1)
+          .stroke();
+        doc.moveDown(0.5);
+        doc.fillColor("#222").fontSize(10);
+        lines.forEach(([k, v]) => {
+          doc
+            .fillColor("#555")
+            .text(String(k), margin + 10, doc.y, { width: 160 })
+            .fillColor("#111")
+            .text(String(v ?? "-"), margin + 180, doc.y - 12, { width: contentWidth - 190 });
+          doc.moveDown(0.2);
+        });
+        doc.y = boxTop + Math.max(24, lines.length * 14 + 10) + 14;
+      };
+
+      drawSection("Rider Details", [
+        ["Rider Unique ID", riderCode || "-"],
+        ["Full Name", formData?.fullName || formData?.name || "-"],
+        ["Mobile", formData?.phone || formData?.mobile || "-"],
+        ["Zone", formData?.zone || formData?.operationalZone || "-"],
+      ]);
+
+      const parseMoney = (value) => {
+        if (value === undefined || value === null) return null;
+        const s = String(value).trim();
+        if (!s) return null;
+        const cleaned = s.replace(/[^0-9.\-]+/g, "");
+        if (!cleaned) return null;
+        const n = Number(cleaned);
+        if (!Number.isFinite(n)) return null;
+        return Number(n.toFixed(2));
+      };
+
+      const formatMoney = (value) => {
+        const n = parseMoney(value);
+        if (n === null) return "";
+        return Number.isInteger(n) ? String(n) : n.toFixed(2);
+      };
+
+      const paidAmountRaw = (() => {
+        const candidates = [
+          formData?.amountPaid,
+          formData?.paidAmount,
+          formData?.paymentDetails?.totalAmount,
+          formData?.totalAmount,
+          formData?.amount,
+        ];
+
+        for (const v of candidates) {
+          const parsed = parseMoney(v);
+          if (parsed !== null && parsed > 0) return parsed;
+        }
+        for (const v of candidates) {
+          const parsed = parseMoney(v);
+          if (parsed !== null) return parsed;
+        }
+        return "";
+      })();
+
+      const paidAmount = formatMoney(paidAmountRaw);
+      drawSection("Payment Receipt", [
+        ["Payment Mode", formData?.paymentMode || formData?.paymentMethod || "-"],
+        ["Rental Amount", formData?.rentalAmount ?? "-"],
+        ["Security Deposit", formData?.securityDeposit ?? "-"],
+        ["Total Amount", formData?.totalAmount ?? "-"],
+        ["Amount Paid", paidAmount || "-"],
+      ]);
+
+      drawSection("Rental Details", [
+        ["Vehicle Number", formData?.vehicleNumber || formData?.bikeId || "-"],
+        ["Rental Start", formData?.rentalStart || "-"],
+        ["Return Date", formData?.rentalEnd || "-"],
+        ["Package", formData?.rentalPackage || "-"],
+      ]);
+
+      drawSection("Terms & Conditions", [
+        ["1.", "This receipt is proof of payment only; it does not guarantee vehicle availability."],
+        ["2.", "Security deposit (if any) is refundable subject to vehicle return and inspection as per company policy."],
+        ["3.", "Rider must carry valid ID and follow all traffic rules and local regulations."],
+        ["4.", "Charges may apply for damages, missing accessories, late returns, or policy violations."],
+        ["5.", "For corrections or support, contact the EVegah team with the receipt number."],
+      ]);
+
+      doc
+        .fillColor(primary)
+        .rect(margin, doc.y, contentWidth, 16)
+        .fill();
+      doc
+        .fillColor("#fff")
+        .fontSize(11)
+        .text("Agreement", margin + 10, doc.y + 4);
+      doc.moveDown(1.2);
+      doc
+        .strokeColor(border)
+        .lineWidth(1)
+        .rect(margin, doc.y, contentWidth, 60)
+        .stroke();
+      doc
+        .fillColor("#333")
+        .fontSize(10)
+        .text(
+          "This receipt is generated electronically and acts as a payment acknowledgement for rider registration.",
+          margin + 10,
+          doc.y + 10,
+          { width: contentWidth - 20 }
+        );
+      doc.moveDown(4);
+
+      doc
+        .fillColor("#555")
+        .fontSize(9)
+        .text("System-generated message for rider registration.", margin, doc.y + 10, {
+          width: contentWidth,
+          align: "left",
+        });
+
+      doc.end();
+    } catch (e) {
+      reject(e);
+    }
+  });
+}
+
+const adminEmail = "adminev@gmail.com";
+
+let firebaseReady = false;
+try {
+  const jsonRaw = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
+  const pathRaw = process.env.FIREBASE_SERVICE_ACCOUNT_PATH;
+
+  let serviceAccount = null;
+  if (jsonRaw) {
+    serviceAccount = JSON.parse(jsonRaw);
+  } else if (pathRaw) {
+    const absPath = path.isAbsolute(pathRaw)
+      ? pathRaw
+      : path.resolve(__dirname, pathRaw);
+    const file = fs.readFileSync(absPath, "utf8");
+    serviceAccount = JSON.parse(file);
+  } else {
+    // Local dev convenience: if repo-root serviceAccountKey.json exists, use it.
+    const defaultPath = path.resolve(__dirname, "..", "serviceAccountKey.json");
+    if (fs.existsSync(defaultPath)) {
+      const file = fs.readFileSync(defaultPath, "utf8");
+      serviceAccount = JSON.parse(file);
+    }
+  }
+
+  if (serviceAccount && !admin.apps.length) {
+    admin.initializeApp({
+      credential: admin.credential.cert(serviceAccount),
+    });
+    firebaseReady = true;
+  } else if (admin.apps.length) {
+    firebaseReady = true;
+  } else {
+    console.warn(
+      "Firebase Admin not configured. Set FIREBASE_SERVICE_ACCOUNT_PATH (preferred) or FIREBASE_SERVICE_ACCOUNT_JSON in server/.env"
+    );
+  }
+} catch (e) {
+  console.warn(
+    "Failed to init Firebase Admin. Check FIREBASE_SERVICE_ACCOUNT_PATH/JSON:",
+    String(e?.message || e)
+  );
+}
+
+async function requireAdmin(req, res, next) {
+  if (!firebaseReady) {
+    return res.status(500).json({
+      error:
+        "Firebase Admin not configured. Set FIREBASE_SERVICE_ACCOUNT_PATH (preferred) or FIREBASE_SERVICE_ACCOUNT_JSON in server/.env",
+    });
+  }
+
+  const authHeader = String(req.headers.authorization || "");
+  const match = authHeader.match(/^Bearer\s+(.+)$/i);
+  if (!match) return res.status(401).json({ error: "Authorization token required" });
+
+  try {
+    const decoded = await admin.auth().verifyIdToken(match[1]);
+    const email = String(decoded.email || "").toLowerCase();
+    const role = decoded.role || "employee";
+
+    if (email !== adminEmail && role !== "admin") {
+      return res.status(403).json({ error: "Admin access required" });
+    }
+
+    req.user = decoded;
+    next();
+  } catch {
+    return res.status(401).json({ error: "Invalid or expired token" });
+  }
+}
+
+async function requireUser(req, res, next) {
+  if (!firebaseReady) {
+    return res.status(500).json({
+      error:
+        "Firebase Admin not configured. Set FIREBASE_SERVICE_ACCOUNT_PATH (preferred) or FIREBASE_SERVICE_ACCOUNT_JSON in server/.env",
+    });
+  }
+
+  const authHeader = String(req.headers.authorization || "");
+  const match = authHeader.match(/^Bearer\s+(.+)$/i);
+  if (!match) return res.status(401).json({ error: "Authorization token required" });
+
+  try {
+    const decoded = await admin.auth().verifyIdToken(match[1]);
+    req.user = decoded;
+    next();
+  } catch {
+    return res.status(401).json({ error: "Invalid or expired token" });
+  }
+}
+
+function envStr(name, fallback = "") {
+  const raw = process.env[name];
+  if (raw === undefined || raw === null) return fallback;
+  return String(raw).trim();
+}
+
+function buildUrl(base, params) {
+  const url = new URL(base);
+  for (const [k, v] of Object.entries(params || {})) {
+    if (v === undefined || v === null) continue;
+    const s = String(v);
+    if (!s) continue;
+    url.searchParams.set(k, s);
+  }
+  return url.toString();
+}
+
+function parseScopeList(raw) {
+  const s = String(raw || "").trim();
+  if (!s) return "";
+  return s
+    .split(/[\s,]+/g)
+    .map((x) => x.trim())
+    .filter(Boolean)
+    .join(" ");
+}
+
+function parseOriginList(raw) {
+  const s = String(raw || "").trim();
+  if (!s) return [];
+  return s
+    .split(/[\s,]+/g)
+    .map((x) => x.trim())
+    .filter(Boolean);
+}
+
+function tryGetOriginFromUrl(value) {
+  const s = String(value || "").trim();
+  if (!s) return "";
+  try {
+    return new URL(s).origin;
+  } catch {
+    return "";
+  }
+}
+
+function isLocalHostname(hostname) {
+  const h = String(hostname || "").trim().toLowerCase();
+  return h === "localhost" || h === "127.0.0.1" || h === "::1";
+}
+
+function removeScope(scopeStr, scopeToRemove) {
+  const target = String(scopeToRemove || "").trim().toLowerCase();
+  if (!target) return String(scopeStr || "").trim();
+  const parts = String(scopeStr || "")
+    .split(/[\s,]+/g)
+    .map((x) => x.trim())
+    .filter(Boolean);
+  return parts.filter((p) => p.toLowerCase() !== target).join(" ");
+}
+
+function isProbablyBase64(s) {
+  const v = String(s || "").trim();
+  if (!v || v.length < 16) return false;
+  // Base64 strings are usually length%4==0, but not always (URL-safe variants / trimmed padding exist).
+  return /^[A-Za-z0-9+/=\r\n_-]+$/.test(v);
+}
+
+function tryDecodeBase64ToUtf8(s) {
+  const v = String(s || "").trim();
+  if (!isProbablyBase64(v)) return null;
+  try {
+    const cleaned = v.replace(/\s+/g, "");
+    const buf = Buffer.from(cleaned, "base64");
+    const text = buf.toString("utf8");
+    // Very rough sanity check: XML should contain '<'
+    if (text.includes("<") && text.includes(">")) return text;
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function parseAadhaarXmlLike(input) {
+  // DigiLocker eaadhaar endpoints often return XML text (not JSON).
+  // We extract attributes from <PrintLetterBarcodeData ... /> when present.
+  const xml = String(input || "");
+  const m = xml.match(/<\s*PrintLetterBarcodeData\b([^>]*)\/?\s*>/i);
+  if (!m) return null;
+  const attrText = m[1] || "";
+  const attrs = {};
+  const re = /([A-Za-z_][A-Za-z0-9_:-]*)\s*=\s*"([^"]*)"/g;
+  let mm;
+  while ((mm = re.exec(attrText))) {
+    const key = String(mm[1] || "").trim();
+    const val = String(mm[2] || "").trim();
+    if (!key) continue;
+    // Aadhaar XML attribute names vary in casing across providers.
+    // Normalize to lowercase so later lookups (dob/yob/name/house/pc/etc) are consistent.
+    attrs[key.toLowerCase()] = val;
+  }
+  return Object.keys(attrs).length ? attrs : null;
+}
+
+function buildAadhaarAddressFromAttrs(attrs) {
+  if (!attrs) return "";
+  const parts = [
+    attrs.co,
+    attrs.house,
+    attrs.street,
+    attrs.lm,
+    attrs.loc,
+    attrs.vtc,
+    attrs.po,
+    attrs.dist,
+    attrs.subdist,
+    attrs.state,
+    attrs.pc,
+  ]
+    .map((x) => String(x || "").trim())
+    .filter(Boolean);
+  return parts.join(", ").replace(/\s+/g, " ").trim();
+}
+
+function normalizeDobToIso(value) {
+  const v = String(value || "").trim();
+  if (!v) return "";
+  // Already ISO date
+  if (/^\d{4}-\d{2}-\d{2}$/.test(v)) return v;
+  // Year only (common when Aadhaar has only YOB)
+  if (/^\d{4}$/.test(v)) return `${v}-01-01`;
+  // Common Aadhaar XML format: DD-MM-YYYY (or DD/MM/YYYY)
+  const m = v.match(/^(\d{2})[-/](\d{2})[-/](\d{4})$/);
+  if (m) {
+    const dd = m[1];
+    const mm = m[2];
+    const yyyy = m[3];
+    return `${yyyy}-${mm}-${dd}`;
+  }
+  return v;
+}
+
+function normalizeGender(value) {
+  const v = String(value || "").trim();
+  if (!v) return "";
+  const up = v.toUpperCase();
+  if (up === "M" || up === "MALE") return "Male";
+  if (up === "F" || up === "FEMALE") return "Female";
+  if (up === "O" || up === "OTHER") return "Other";
+  return v;
+}
+
+function normalizeIndianMobile(value) {
+  const digits = String(value || "").replace(/\D/g, "");
+  if (!digits) return "";
+  // Keep last 10 digits for Indian mobiles.
+  const last10 = digits.slice(-10);
+  return last10.length === 10 ? last10 : "";
+}
+
+function extractDigiLockerRiderData({ userinfo, aadhaarResponse, fallbackLast4 }) {
+  // Returns { aadhaarNumber, aadhaarLast4, name, dob, gender, permanentAddress, mobile }
+  let aadhaarXmlText = "";
+  let aadhaarAttrs = null;
+
+  if (typeof aadhaarResponse === "string") {
+    aadhaarXmlText = aadhaarResponse;
+  } else if (aadhaarResponse && typeof aadhaarResponse === "object") {
+    const candidates = [
+      aadhaarResponse.xml,
+      aadhaarResponse.data,
+      aadhaarResponse.response,
+      aadhaarResponse.eaadhaar,
+      aadhaarResponse.eAadhaar,
+      aadhaarResponse.xml_data,
+    ];
+    for (const c of candidates) {
+      if (typeof c === "string" && c.trim()) {
+        aadhaarXmlText = c;
+        break;
+      }
+    }
+  }
+
+  if (aadhaarXmlText) {
+    const decoded = tryDecodeBase64ToUtf8(aadhaarXmlText);
+    if (decoded) aadhaarXmlText = decoded;
+    aadhaarAttrs = parseAadhaarXmlLike(aadhaarXmlText);
+  }
+
+  const aadhaarNumber = (() => {
+    const candidates = [
+      aadhaarAttrs?.uid,
+      aadhaarResponse?.aadhaar,
+      aadhaarResponse?.aadhaarNumber,
+      aadhaarResponse?.aadhaar_no,
+      userinfo?.aadhaar,
+      userinfo?.aadhaarNumber,
+      userinfo?.aadhaar_no,
+    ];
+    for (const c of candidates) {
+      const digits = String(c || "").replace(/\D/g, "");
+      if (digits.length === 12) return digits;
+    }
+    return "";
+  })();
+
+  const aadhaarLast4 = (aadhaarNumber ? aadhaarNumber.slice(-4) : String(fallbackLast4 || "").replace(/\D/g, "").slice(-4)) || "";
+  const permanentAddress = buildAadhaarAddressFromAttrs(aadhaarAttrs);
+
+  const name =
+    userinfo?.name ||
+    userinfo?.full_name ||
+    aadhaarAttrs?.name ||
+    "";
+
+  const gender = normalizeGender(
+    userinfo?.gender ||
+    userinfo?.gender_name ||
+    aadhaarAttrs?.gender ||
+    ""
+  );
+
+  const dobRaw =
+    userinfo?.dob ||
+    userinfo?.date_of_birth ||
+    userinfo?.birthdate ||
+    userinfo?.birth_date ||
+    userinfo?.DOB ||
+    userinfo?.DateOfBirth ||
+    userinfo?.profile?.dob ||
+    userinfo?.profile?.date_of_birth ||
+    userinfo?.profile?.birthdate ||
+    userinfo?.profile?.birth_date ||
+    aadhaarAttrs?.dob ||
+    (aadhaarAttrs?.yob ? String(aadhaarAttrs.yob) : "") ||
+    "";
+
+  const dob = normalizeDobToIso(dobRaw);
+
+  const mobile = normalizeIndianMobile(
+    userinfo?.mobile ||
+    userinfo?.mobile_number ||
+    userinfo?.phone_number ||
+    userinfo?.phone ||
+    ""
+  );
+
+  return {
+    aadhaarNumber,
+    aadhaarLast4,
+    name: String(name || ""),
+    dob: String(dob || ""),
+    gender: String(gender || ""),
+    permanentAddress: String(permanentAddress || ""),
+    mobile: String(mobile || ""),
+  };
+}
+
+function inferDigiLockerDocument(aadhaarResponse) {
+  // Prefer Aadhaar response; it may be XML (string), base64 (string), or JSON (object).
+  if (aadhaarResponse === null || aadhaarResponse === undefined) return null;
+
+  const fromText = (textRaw) => {
+    let text = String(textRaw || "").trim();
+    if (!text) return null;
+
+    // If it's base64, decode (often the case for eAadhaar).
+    const decoded = tryDecodeBase64ToUtf8(text);
+    if (decoded) text = decoded;
+
+    const lower = text.toLowerCase();
+    if (text.startsWith("%PDF-")) {
+      return { mime: "application/pdf", filename: "eaadhaar.pdf", buffer: Buffer.from(text, "utf8") };
+    }
+    if (lower.includes("<printletterbarcodedata") || lower.includes("<?xml")) {
+      return { mime: "application/xml", filename: "eaadhaar.xml", buffer: Buffer.from(text, "utf8") };
+    }
+    return { mime: "text/plain", filename: "digilocker.txt", buffer: Buffer.from(text, "utf8") };
+  };
+
+  if (typeof aadhaarResponse === "string") {
+    return fromText(aadhaarResponse);
+  }
+
+  if (typeof aadhaarResponse === "object") {
+    if (aadhaarResponse?.error) return null;
+    const candidates = [
+      aadhaarResponse.xml,
+      aadhaarResponse.data,
+      aadhaarResponse.response,
+      aadhaarResponse.eaadhaar,
+      aadhaarResponse.eAadhaar,
+      aadhaarResponse.xml_data,
+    ];
+    for (const c of candidates) {
+      if (typeof c === "string" && c.trim()) return fromText(c);
+    }
+    const json = JSON.stringify(aadhaarResponse);
+    return { mime: "application/json", filename: "digilocker.json", buffer: Buffer.from(json, "utf8") };
+  }
+
+  return null;
+}
+
+const DIGILOCKER = {
+  clientId: envStr("DIGILOCKER_CLIENT_ID"),
+  clientSecret: envStr("DIGILOCKER_CLIENT_SECRET"),
+  authorizeUrl: envStr("DIGILOCKER_AUTHORIZE_URL"),
+  tokenUrl: envStr("DIGILOCKER_TOKEN_URL"),
+  redirectUri: envStr("DIGILOCKER_REDIRECT_URI"),
+  // DigiLocker/APISetu scope support varies by API product. Keep this fully configurable.
+  // If your token endpoint complains about "openid", remove it from DIGILOCKER_SCOPES.
+  scopes: parseScopeList(envStr("DIGILOCKER_SCOPES")),
+  disableOpenId: ["true", "1", "yes"].includes(envStr("DIGILOCKER_DISABLE_OPENID", "false").toLowerCase()),
+  tokenAuthMethod: envStr("DIGILOCKER_TOKEN_AUTH_METHOD", "body").toLowerCase(),
+  usePkce: ["true", "1", "yes"].includes(envStr("DIGILOCKER_USE_PKCE", "false").toLowerCase()),
+  dlFlow: envStr("DIGILOCKER_DL_FLOW"),
+  acr: envStr("DIGILOCKER_ACR"),
+  amr: envStr("DIGILOCKER_AMR"),
+  userinfoUrl: envStr("DIGILOCKER_USERINFO_URL"),
+  aadhaarUrl: envStr("DIGILOCKER_AADHAAR_URL"),
+  webOrigin: envStr("PUBLIC_WEB_ORIGIN"),
+};
+
+const DIGILOCKER_ALLOWED_WEB_ORIGINS = parseOriginList(envStr("PUBLIC_WEB_ORIGIN"));
+
+const DIGILOCKER_ENABLED = Boolean(
+  DIGILOCKER.clientId &&
+  DIGILOCKER.clientSecret &&
+  DIGILOCKER.authorizeUrl &&
+  DIGILOCKER.tokenUrl &&
+  DIGILOCKER.redirectUri
+);
+
+// state -> { uid, createdAtMs, aadhaarLast4, codeVerifier? }
+const digilockerStateStore = new Map();
+const DIGILOCKER_STATE_TTL_MS = 10 * 60 * 1000;
+
+// docId -> { uid, createdAtMs, mime, filename, buffer }
+const digilockerDocumentStore = new Map();
+const DIGILOCKER_DOC_TTL_MS = 10 * 60 * 1000;
+
+function pruneDigiLockerStates(now = Date.now()) {
+  for (const [key, value] of digilockerStateStore.entries()) {
+    if (!value?.createdAtMs || now - value.createdAtMs > DIGILOCKER_STATE_TTL_MS) {
+      digilockerStateStore.delete(key);
+    }
+  }
+}
+
+function pruneDigiLockerDocuments(now = Date.now()) {
+  for (const [key, value] of digilockerDocumentStore.entries()) {
+    if (!value?.createdAtMs || now - value.createdAtMs > DIGILOCKER_DOC_TTL_MS) {
+      digilockerDocumentStore.delete(key);
+    }
+  }
+}
+
+function createDigiLockerDocId() {
+  return crypto.randomBytes(24).toString("hex");
+}
+
+function createDigiLockerState() {
+  return crypto.randomBytes(24).toString("hex");
+}
+
+function base64UrlEncode(buffer) {
+  return Buffer.from(buffer)
+    .toString("base64")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/g, "");
+}
+
+function createPkceCodeVerifier() {
+  // RFC 7636: 43..128 characters, unreserved
+  return base64UrlEncode(crypto.randomBytes(32));
+}
+
+function createPkceCodeChallengeS256(codeVerifier) {
+  const digest = crypto.createHash("sha256").update(String(codeVerifier), "utf8").digest();
+  return base64UrlEncode(digest);
+}
+
+async function postFormUrlEncoded(url, { headers = {}, bodyObj = {} } = {}) {
+  const body = new URLSearchParams();
+  for (const [k, v] of Object.entries(bodyObj)) {
+    if (v === undefined || v === null) continue;
+    body.set(k, String(v));
+  }
+
+  const timeoutMs = Number(process.env.DIGILOCKER_HTTP_TIMEOUT_MS || process.env.HTTP_TIMEOUT_MS || 15000);
+  const retries = Number(process.env.DIGILOCKER_HTTP_RETRIES || 1);
+  let res;
+  try {
+    res = await fetchWithRetry(
+      url,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          ...headers,
+        },
+        body,
+      },
+      { timeoutMs, retries }
+    );
+  } catch (e) {
+    // Production observed: one DigiLocker resolved IP resets TLS handshake (connection reset by peer).
+    // Fallback: resolve all A records and try each IP with SNI set to the hostname.
+    const host = (() => {
+      try {
+        return new URL(url).hostname;
+      } catch {
+        return "";
+      }
+    })();
+    const isDigiLocker = host === "api.digitallocker.gov.in" || host.endsWith(".digitallocker.gov.in");
+    if (!isDigiLocker || !isRetryableNetworkError(e)) throw e;
+
+    const fallback = await tryHttpsAcrossResolvedIps({
+      url,
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        ...headers,
+      },
+      body: body.toString(),
+      timeoutMs,
+    });
+
+    const text = fallback.text;
+    let data = null;
+    try {
+      data = text ? JSON.parse(text) : null;
+    } catch {
+      data = text;
+    }
+    if (!(fallback.status >= 200 && fallback.status < 300)) {
+      const message =
+        (data && typeof data === "object" && (data.error_description || data.error))
+          ? String(data.error_description || data.error)
+          : typeof data === "string"
+            ? data
+            : `Request failed (${fallback.status})`;
+      const err = new Error(`${message} (ip=${fallback.ip})`);
+      err.status = fallback.status;
+      err.data = data;
+      throw err;
+    }
+    return data;
+  }
+
+  const text = await res.text();
+  let data = null;
+  try {
+    data = text ? JSON.parse(text) : null;
+  } catch {
+    data = text;
+  }
+  if (!res.ok) {
+    const message =
+      (data && typeof data === "object" && (data.error_description || data.error))
+        ? String(data.error_description || data.error)
+        : typeof data === "string"
+          ? data
+          : `Request failed (${res.status})`;
+    const err = new Error(message);
+    err.status = res.status;
+    err.data = data;
+    throw err;
+  }
+  return data;
+}
+
+async function fetchJson(url, { method = "GET", headers = {}, body } = {}) {
+  const timeoutMs = Number(process.env.DIGILOCKER_HTTP_TIMEOUT_MS || process.env.HTTP_TIMEOUT_MS || 15000);
+  const retries = Number(process.env.DIGILOCKER_HTTP_RETRIES || 1);
+  let res;
+  try {
+    res = await fetchWithRetry(
+      url,
+      {
+        method,
+        headers,
+        body,
+      },
+      { timeoutMs, retries }
+    );
+  } catch (e) {
+    const host = (() => {
+      try {
+        return new URL(url).hostname;
+      } catch {
+        return "";
+      }
+    })();
+    const isDigiLocker = host === "api.digitallocker.gov.in" || host.endsWith(".digitallocker.gov.in");
+    if (!isDigiLocker || !isRetryableNetworkError(e)) throw e;
+
+    const fallback = await tryHttpsAcrossResolvedIps({
+      url,
+      method,
+      headers,
+      body: body ?? undefined,
+      timeoutMs,
+    });
+
+    const text = fallback.text;
+    let data = null;
+    try {
+      data = text ? JSON.parse(text) : null;
+    } catch {
+      data = text;
+    }
+    if (!(fallback.status >= 200 && fallback.status < 300)) {
+      const message =
+        (data && typeof data === "object" && data.error) ? String(data.error) :
+          (typeof data === "string" && data) ? data :
+            `Request failed (${fallback.status})`;
+      const err = new Error(`${message} (ip=${fallback.ip})`);
+      err.status = fallback.status;
+      err.data = data;
+      throw err;
+    }
+    return data;
+  }
+
+  const text = await res.text();
+  let data = null;
+  try {
+    data = text ? JSON.parse(text) : null;
+  } catch {
+    data = text;
+  }
+  if (!res.ok) {
+    const message =
+      (data && typeof data === "object" && data.error) ? String(data.error) :
+        (typeof data === "string" && data) ? data :
+          `Request failed (${res.status})`;
+    const err = new Error(message);
+    err.status = res.status;
+    err.data = data;
+    throw err;
+  }
+  return data;
+}
+
+app.get("/api/health", async (_req, res) => {
+  try {
+    const result = await pool.query(
+      "select 1 as ok, current_database() as database, current_user as user, to_regclass('public.riders') as riders_table"
+    );
+    const row = result.rows?.[0] || {};
+    res.json({
+      ok: true,
+      db: row.ok === 1,
+      database: row.database || null,
+      user: row.user || null,
+      ridersTable: row.riders_table || null,
+    });
+  } catch (error) {
+    res.status(500).json({ ok: false, error: String(error?.message || error) });
+  }
+});
+
+app.get("/api/digilocker/status", (_req, res) => {
+  return res.json({
+    enabled: DIGILOCKER_ENABLED,
+    configured: {
+      clientId: Boolean(DIGILOCKER.clientId),
+      clientSecret: Boolean(DIGILOCKER.clientSecret),
+      authorizeUrl: Boolean(DIGILOCKER.authorizeUrl),
+      tokenUrl: Boolean(DIGILOCKER.tokenUrl),
+      redirectUri: Boolean(DIGILOCKER.redirectUri),
+      scopes: Boolean(DIGILOCKER.scopes),
+      webOrigin: Boolean(DIGILOCKER.webOrigin),
+    },
+    effective: {
+      redirectUri: DIGILOCKER.redirectUri || "",
+      webOrigin: DIGILOCKER.webOrigin || "",
+      usePkce: Boolean(DIGILOCKER.usePkce),
+      tokenAuthMethod: DIGILOCKER.tokenAuthMethod || "body",
+    },
+  });
+});
+
+app.get("/api/digilocker/document/:id", requireUser, (req, res) => {
+  pruneDigiLockerDocuments();
+  const id = String(req.params?.id || "").trim();
+  if (!id) return res.sendStatus(404);
+
+  const entry = digilockerDocumentStore.get(id);
+  if (!entry) return res.sendStatus(404);
+  if (String(entry.uid || "") !== String(req.user?.uid || "")) return res.sendStatus(404);
+
+  // One-time read to reduce exposure.
+  digilockerDocumentStore.delete(id);
+
+  const filename = String(entry.filename || "digilocker_document")
+    .replace(/[^a-z0-9._-]+/gi, "-")
+    .slice(0, 120);
+
+  res.setHeader("Content-Type", String(entry.mime || "application/octet-stream"));
+  res.setHeader("Content-Disposition", `attachment; filename=${filename}`);
+  return res.status(200).send(entry.buffer);
+});
+
+app.post("/api/digilocker/auth-url", requireUser, (req, res) => {
+  pruneDigiLockerStates();
+
+  if (!DIGILOCKER_ENABLED) {
+    return res.status(503).json({
+      error:
+        "DigiLocker is not configured on the server. Set DIGILOCKER_CLIENT_ID, DIGILOCKER_CLIENT_SECRET, DIGILOCKER_AUTHORIZE_URL, DIGILOCKER_TOKEN_URL, DIGILOCKER_REDIRECT_URI in server/.env",
+    });
+  }
+
+  const aadhaarDigits = String(req.body?.aadhaar || "").replace(/\D/g, "").slice(0, 12);
+  const aadhaarLast4 = aadhaarDigits ? aadhaarDigits.slice(-4) : "";
+
+  const state = createDigiLockerState();
+
+  const statePayload = {
+    uid: String(req.user?.uid || ""),
+    createdAtMs: Date.now(),
+    aadhaarLast4,
+  };
+
+  // Remember the web app origin that initiated the popup flow.
+  // This is used to postMessage back to the correct origin on callback.
+  const requestOrigin = String(req.get("origin") || "").trim();
+  const requestRefererOrigin = tryGetOriginFromUrl(req.get("referer") || "");
+  const candidateOrigin = requestOrigin || requestRefererOrigin;
+  const isDev = String(process.env.NODE_ENV || "").toLowerCase() !== "production";
+  const isLocalApi = isLocalHostname(req.hostname);
+  if (candidateOrigin) {
+    const allowAny = (isDev || isLocalApi) && DIGILOCKER_ALLOWED_WEB_ORIGINS.length === 0;
+    const allowListed = DIGILOCKER_ALLOWED_WEB_ORIGINS.includes(candidateOrigin);
+    if (allowAny || allowListed || isLocalApi) {
+      statePayload.webOrigin = candidateOrigin;
+    }
+  }
+
+  // APISetu portal generated URLs typically use PKCE (S256).
+  let pkce = null;
+  if (DIGILOCKER.usePkce) {
+    const codeVerifier = createPkceCodeVerifier();
+    const codeChallenge = createPkceCodeChallengeS256(codeVerifier);
+    pkce = { codeVerifier, codeChallenge, codeChallengeMethod: "S256" };
+    statePayload.codeVerifier = codeVerifier;
+  }
+
+  digilockerStateStore.set(state, statePayload);
+
+  const effectiveScopes = DIGILOCKER.disableOpenId
+    ? removeScope(DIGILOCKER.scopes, "openid")
+    : DIGILOCKER.scopes;
+
+  const authUrl = buildUrl(DIGILOCKER.authorizeUrl, {
+    response_type: "code",
+    // Some OAuth providers may default to returning the authorization code in the URL fragment.
+    // Fragments are not sent to the server, so we explicitly prefer query mode.
+    response_mode: "query",
+    client_id: DIGILOCKER.clientId,
+    redirect_uri: DIGILOCKER.redirectUri,
+    scope: effectiveScopes,
+    state,
+    ...(DIGILOCKER.dlFlow ? { dl_flow: DIGILOCKER.dlFlow } : {}),
+    ...(DIGILOCKER.acr ? { acr: DIGILOCKER.acr } : {}),
+    ...(DIGILOCKER.amr ? { amr: DIGILOCKER.amr } : {}),
+    ...(pkce
+      ? {
+        code_challenge: pkce.codeChallenge,
+        code_challenge_method: pkce.codeChallengeMethod,
+      }
+      : {}),
+  });
+
+  return res.json({ url: authUrl, state });
+});
+
+app.get("/api/digilocker/callback", async (req, res) => {
+  pruneDigiLockerStates();
+  const code = String(req.query?.code || "").trim();
+  const state = String(req.query?.state || "").trim();
+
+  const oauthError = String(req.query?.error || "").trim();
+  const oauthErrorDescription = String(req.query?.error_description || "").trim();
+
+  const isDev = String(process.env.NODE_ENV || "").toLowerCase() !== "production";
+  // Prefer the exact origin that initiated the flow; fallback to configured PUBLIC_WEB_ORIGIN.
+  // In dev, allow '*' to avoid local/prod origin mismatches.
+  const stateEntryForOrigin = state ? digilockerStateStore.get(state) : null;
+  const targetOrigin =
+    String(stateEntryForOrigin?.webOrigin || "").trim() ||
+    String(DIGILOCKER.webOrigin || "").trim() ||
+    (isDev ? "*" : "*");
+
+  const sendPopupResult = (payload) => {
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    res.setHeader("Cache-Control", "no-store");
+    res.status(200).send(`<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" /><title>DigiLocker</title></head>
+<body>
+<script>
+(function () {
+  var payload = ${JSON.stringify(payload)};
+  try {
+    if (window.opener && window.opener.postMessage) {
+      window.opener.postMessage(payload, ${JSON.stringify(targetOrigin)});
+    }
+  } catch (e) {}
+  try { window.close(); } catch (e) {}
+})();
+</script>
+</body>
+</html>`);
+  };
+
+  if (oauthError) {
+    const msg = oauthErrorDescription ? `${oauthError}: ${oauthErrorDescription}` : oauthError;
+    return sendPopupResult({ type: "DIGILOCKER_RESULT", ok: false, error: msg });
+  }
+
+  if (!code || !state) {
+    // If DigiLocker (or a proxy in between) returns the authorization code in the URL fragment,
+    // the server will never see it. Recover it in the browser and reload with query params.
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    res.setHeader("Cache-Control", "no-store");
+    return res.status(200).send(`<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" /><title>DigiLocker</title></head>
+<body>
+<script>
+(function () {
+  function safePost(payload) {
+    try {
+      if (window.opener && window.opener.postMessage) {
+        window.opener.postMessage(payload, ${JSON.stringify(targetOrigin)});
+      }
+    } catch (e) {}
+    try { window.close(); } catch (e) {}
+  }
+
+  var search = new URLSearchParams(window.location.search || "");
+  var hash = window.location.hash ? new URLSearchParams(String(window.location.hash).replace(/^#/, "")) : null;
+
+  var err = search.get("error") || (hash && hash.get("error")) || "";
+  var errDesc = search.get("error_description") || (hash && hash.get("error_description")) || "";
+  if (err) {
+    safePost({ type: "DIGILOCKER_RESULT", ok: false, error: errDesc ? (err + ": " + errDesc) : err });
+    return;
+  }
+
+  var code2 = search.get("code") || (hash && hash.get("code")) || "";
+  var state2 = search.get("state") || (hash && hash.get("state")) || "";
+
+  // If code/state arrived via fragment, reload with query so the server can exchange the code.
+  if (code2 && state2 && (!search.get("code") || !search.get("state"))) {
+    try {
+      var url = new URL(window.location.href);
+      url.hash = "";
+      url.searchParams.set("code", code2);
+      url.searchParams.set("state", state2);
+      window.location.replace(url.toString());
+      return;
+    } catch (e) {}
+  }
+
+  safePost({ type: "DIGILOCKER_RESULT", ok: false, error: "Missing code/state" });
+})();
+</script>
+</body>
+</html>`);
+  }
+
+  const stateEntry = digilockerStateStore.get(state);
+  digilockerStateStore.delete(state);
+  if (!stateEntry) {
+    return sendPopupResult({ type: "DIGILOCKER_RESULT", ok: false, error: "Invalid or expired state" });
+  }
+
+  if (!DIGILOCKER_ENABLED) {
+    return sendPopupResult({ type: "DIGILOCKER_RESULT", ok: false, error: "DigiLocker not configured" });
+  }
+
+  try {
+    const wrapStepError = (step, err, { url } = {}) => {
+      const status = err?.status ? ` (${err.status})` : "";
+      const base = String(err?.message || err || "Unknown error");
+      const causeDetail = describeFetchCause(err) || describeFetchCause(err?.cause) || "";
+      const target = url ? ` (${String(url)})` : "";
+      const detailSuffix = causeDetail ? ` [${causeDetail}]` : "";
+      const e2 = new Error(`${step}${status}: ${base}${target}${detailSuffix}`);
+      if (err?.status) e2.status = err.status;
+      if (err?.data !== undefined) e2.data = err.data;
+      e2.step = step;
+      throw e2;
+    };
+
+    const tokenHeaders = {};
+    const tokenBody = {
+      grant_type: "authorization_code",
+      code,
+      redirect_uri: DIGILOCKER.redirectUri,
+      client_id: DIGILOCKER.clientId,
+    };
+
+    if (stateEntry?.codeVerifier) {
+      tokenBody.code_verifier = stateEntry.codeVerifier;
+    }
+
+    if (DIGILOCKER.tokenAuthMethod === "basic") {
+      const basic = Buffer.from(`${DIGILOCKER.clientId}:${DIGILOCKER.clientSecret}`, "utf8").toString("base64");
+      tokenHeaders.Authorization = `Basic ${basic}`;
+    } else {
+      tokenBody.client_secret = DIGILOCKER.clientSecret;
+    }
+
+    const exchangeToken = async (tokenUrl) => {
+      return postFormUrlEncoded(tokenUrl, {
+        headers: tokenHeaders,
+        bodyObj: tokenBody,
+      });
+    };
+
+    let token;
+    try {
+      token = await exchangeToken(DIGILOCKER.tokenUrl);
+    } catch (e) {
+      const message = String(e?.message || e || "").toLowerCase();
+      // DigiLocker/APISetu has multiple OAuth endpoint versions; some client/API configurations
+      // respond with a misleading "grant_type unsupported... disable openid" when using /oauth2/1/token.
+      // Retry once against /oauth2/2/token to improve compatibility.
+      const canRetry =
+        message.includes("grant_type") &&
+        message.includes("unsupported") &&
+        message.includes("disable") &&
+        message.includes("openid") &&
+        String(DIGILOCKER.tokenUrl || "").includes("/oauth2/1/token");
+      if (!canRetry) {
+        wrapStepError("DigiLocker token exchange failed", e, { url: DIGILOCKER.tokenUrl });
+      }
+      const tokenUrl2 = String(DIGILOCKER.tokenUrl).replace("/oauth2/1/token", "/oauth2/2/token");
+      try {
+        token = await exchangeToken(tokenUrl2);
+      } catch (e2) {
+        wrapStepError("DigiLocker token exchange retry failed", e2, { url: tokenUrl2 });
+      }
+    }
+
+    const accessToken = String(token?.access_token || "").trim();
+    if (!accessToken) {
+      return sendPopupResult({ type: "DIGILOCKER_RESULT", ok: false, error: "No access_token returned" });
+    }
+
+    const authzHeaders = { Authorization: `Bearer ${accessToken}` };
+
+    let userinfo = null;
+    if (DIGILOCKER.userinfoUrl) {
+      try {
+        userinfo = await fetchJson(DIGILOCKER.userinfoUrl, { headers: authzHeaders });
+      } catch (e) {
+        userinfo = {
+          error: `userinfo failed${e?.status ? ` (${e.status})` : ""}: ${String(e?.message || e)}`,
+        };
+      }
+    }
+
+    let aadhaar = null;
+    if (DIGILOCKER.aadhaarUrl) {
+      try {
+        aadhaar = await fetchJson(DIGILOCKER.aadhaarUrl, { headers: authzHeaders });
+      } catch (e) {
+        aadhaar = {
+          error: `eaadhaar failed${e?.status ? ` (${e.status})` : ""}: ${String(e?.message || e)}`,
+        };
+      }
+    }
+
+    pruneDigiLockerDocuments();
+    const inferredDoc = inferDigiLockerDocument(aadhaar);
+    const documentId = inferredDoc && inferredDoc.buffer && inferredDoc.buffer.length
+      ? (() => {
+        const id = createDigiLockerDocId();
+        digilockerDocumentStore.set(id, {
+          uid: stateEntry?.uid || "",
+          createdAtMs: Date.now(),
+          mime: inferredDoc.mime,
+          filename: inferredDoc.filename,
+          buffer: inferredDoc.buffer,
+        });
+        return id;
+      })()
+      : "";
+
+    const extracted = extractDigiLockerRiderData({
+      userinfo,
+      aadhaarResponse: aadhaar,
+      fallbackLast4: stateEntry?.aadhaarLast4 || "",
+    });
+
+    return sendPopupResult({
+      type: "DIGILOCKER_RESULT",
+      ok: true,
+      uid: stateEntry?.uid || null,
+      data: {
+        aadhaar: extracted.aadhaarNumber || "",
+        aadhaar_last4: extracted.aadhaarLast4 || "",
+        name: extracted.name || "",
+        dob: extracted.dob || "",
+        gender: extracted.gender || "",
+        permanent_address: extracted.permanentAddress || "",
+        mobile: extracted.mobile || "",
+        document_id: documentId || "",
+        document_mime: inferredDoc?.mime || "",
+        document_name: inferredDoc?.filename || "",
+        // Add document_image as a base64 string if the document is an image
+        ...(inferredDoc && inferredDoc.mime && inferredDoc.mime.startsWith("image/") && inferredDoc.buffer
+          ? { document_image: `data:${inferredDoc.mime};base64,${inferredDoc.buffer.toString('base64')}` }
+          : {}),
+      },
+    });
+  } catch (e) {
+    const status = e?.status ? ` (${e.status})` : "";
+    const message = `DigiLocker error${status}: ${String(e?.message || e || "Unknown")}`;
+    return sendPopupResult({ type: "DIGILOCKER_RESULT", ok: false, error: message });
+  }
+});
+
+app.get("/api/availability", async (_req, res) => {
+  const client = await pool.connect();
+  try {
+    const availability = await getActiveAvailability({ client });
+    res.json({
+      unavailableVehicleIds: availability.unavailableVehicleIds,
+      unavailableBatteryIds: availability.unavailableBatteryIds,
+    });
+  } catch (error) {
+    res.status(500).json({ error: String(error?.message || error) });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/api/admin/availability/reset", requireAdmin, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const resetAt = await resetAvailabilityCheckpoint({
+      client,
+      resetByUid: req.user?.uid || req.user?.user_id || req.user?.sub || "",
+      resetByEmail: req.user?.email || "",
+      reason: req.body?.reason || "manual-admin-reset",
+    });
+
+    res.json({ ok: true, resetAt });
+  } catch (error) {
+    res.status(500).json({ error: String(error?.message || error) });
+  } finally {
+    client.release();
+  }
+});
+
+function parseMoneyValue(value) {
+  if (value === undefined || value === null) return null;
+  const s = String(value).trim();
+  if (!s) return null;
+  const cleaned = s.replace(/[^0-9.\-]+/g, "");
+  if (!cleaned) return null;
+  const n = Number(cleaned);
+  if (!Number.isFinite(n)) return null;
+  return Number(n.toFixed(2));
+}
+
+function formatMoneyCompact(value) {
+  const n = parseMoneyValue(value);
+  if (n === null) return "";
+  return Number.isInteger(n) ? String(n) : n.toFixed(2);
+}
+
+function firstPositiveMoneyValue(values) {
+  for (const v of values) {
+    const n = parseMoneyValue(v);
+    if (n !== null && n > 0) return n;
+  }
+  return null;
+}
+
+function firstAnyMoneyValue(values) {
+  for (const v of values) {
+    const n = parseMoneyValue(v);
+    if (n !== null) return n;
+  }
+  return null;
+}
+
+async function resolveReceiptAmountPaid({ formData, registration }) {
+  const merchantTranId =
+    String(
+      formData?.merchantTranId ||
+      formData?.iciciMerchantTranId ||
+      formData?.paymentDetails?.merchantTranId ||
+      formData?.paymentDetails?.iciciMerchantTranId ||
+      registration?.merchantTranId ||
+      registration?.iciciMerchantTranId ||
+      ""
+    ).trim();
+
+  const rentalId = String(registration?.rentalId || registration?.rental_id || formData?.rentalId || "").trim();
+
+  // 1) Prefer DB source-of-truth when possible
+  try {
+    if (merchantTranId) {
+      const { rows } = await pool.query(
+        `select amount, status
+         from public.payment_transactions
+         where merchant_tran_id = $1
+         limit 1`,
+        [merchantTranId]
+      );
+      const amount = rows?.[0]?.amount;
+      const parsed = parseMoneyValue(amount);
+      if (parsed !== null && parsed > 0) return parsed;
+      // If amount is present but 0 (unlikely), keep looking at formData fallbacks.
+    }
+
+    if (rentalId) {
+      const { rows } = await pool.query(
+        `select amount, status
+         from public.payment_transactions
+         where rental_id = $1
+         order by (status = 'SUCCESS')::int desc, created_at desc
+         limit 1`,
+        [rentalId]
+      );
+      const amount = rows?.[0]?.amount;
+      const parsed = parseMoneyValue(amount);
+      if (parsed !== null && parsed > 0) return parsed;
+    }
+  } catch (e) {
+    // Non-fatal; we can still derive from the request payload.
+    console.warn("resolveReceiptAmountPaid: DB lookup failed", String(e?.message || e));
+  }
+
+  // 2) Fallback: derive from payload (ignore blanks; prefer positive over zero)
+  const derivedTotal = (() => {
+    const rental = parseMoneyValue(formData?.rentalAmount);
+    const deposit = parseMoneyValue(formData?.securityDeposit);
+    if (rental !== null && deposit !== null) return Number((rental + deposit).toFixed(2));
+    return null;
+  })();
+
+  const candidates = [
+    formData?.amountPaid,
+    formData?.paidAmount,
+    formData?.paymentDetails?.totalAmount,
+    formData?.totalAmount,
+    formData?.amount,
+    derivedTotal,
+  ];
+
+  return firstPositiveMoneyValue(candidates) ?? firstAnyMoneyValue(candidates);
+}
+
+app.post("/api/receipts/rider/pdf", async (req, res) => {
+  try {
+    const { formData, registration } = req.body || {};
+    if (!formData) return res.status(400).json({ error: "Missing formData" });
+
+    const resolvedAmount = await resolveReceiptAmountPaid({ formData, registration });
+    const formDataForReceipt = resolvedAmount === null
+      ? formData
+      : {
+        ...formData,
+        amountPaid: resolvedAmount,
+        paidAmount: resolvedAmount,
+        // Keep totalAmount if it exists; otherwise, use resolved amount.
+        totalAmount: formData?.totalAmount ?? resolvedAmount,
+      };
+
+    const buffer = await createReceiptPdfBuffer({ formData: formDataForReceipt, registration });
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", "attachment; filename=EVegah_Receipt.pdf");
+    return res.status(200).send(buffer);
+  } catch (e) {
+    console.error("Receipt PDF generation failed", e);
+    return res.status(500).json({ error: "Failed to generate receipt PDF" });
+  }
+});
+
+app.post("/api/whatsapp/send-receipt", async (req, res) => {
+  try {
+    const { to, formData, registration } = req.body || {};
+    const toDigitsValue = toDigits(to, 10);
+    if (toDigitsValue.length !== 10) return res.status(400).json({ error: "Invalid mobile number" });
+    if (!formData) return res.status(400).json({ error: "Missing formData" });
+
+    const resolvedAmount = await resolveReceiptAmountPaid({ formData, registration });
+    const resolvedAmountText = resolvedAmount === null ? "" : formatMoneyCompact(resolvedAmount);
+    const formDataForReceipt = resolvedAmount === null
+      ? formData
+      : {
+        ...formData,
+        amountPaid: resolvedAmount,
+        paidAmount: resolvedAmount,
+        totalAmount: formData?.totalAmount ?? resolvedAmount,
+      };
+
+    const publicBaseUrl = String(process.env.PUBLIC_BASE_URL || "").trim();
+    const hasPublicBaseUrl = Boolean(publicBaseUrl);
+
+    // In most deployments (PM2 + Nginx), the Node API is proxied under /api.
+    // Default to /api/uploads so the receipt is reachable externally without
+    // requiring a separate Nginx rule for /uploads.
+    // Override via PUBLIC_UPLOADS_PREFIX (e.g. "/uploads" or "/api/uploads").
+    const uploadsPrefix = String(process.env.PUBLIC_UPLOADS_PREFIX || "/api/uploads").trim() || "/api/uploads";
+    const publicUploadsPrefix = hasPublicBaseUrl
+      ? (() => {
+        const base = publicBaseUrl.replace(/\/+$/, "");
+        const prefix = uploadsPrefix.replace(/^\/+/, "").replace(/\/+$/, "");
+        return prefix ? `${base}/${prefix}` : base;
+      })()
+      : "";
+
+    const rawReceiptId = `${registration?.rentalId || registration?.riderId || Date.now()}`;
+    const receiptId = (() => {
+      const s = String(rawReceiptId || "").trim();
+      if (!s) return String(Date.now());
+      const base = s.split("-")[0] || s;
+      if (base && base.length >= 6) return `EVEGAH-${base.toUpperCase()}`;
+      return s;
+    })();
+
+    // Prefer a human-friendly receipt number for templates / buttons when available.
+    // `registration.riderCode` already exists in this app (e.g. RDR-202601-XXXXXX).
+    const receiptNumber = String(registration?.riderCode || "").trim() || receiptId;
+
+    // Always write a unique internal filename for storage/back-compat.
+    const internalFileName = `receipt_${receiptId}.pdf`;
+    const internalAbsPath = path.join(uploadsDir, internalFileName);
+    const pdfBuffer = await createReceiptPdfBuffer({ formData: formDataForReceipt, registration });
+    await fs.promises.writeFile(internalAbsPath, pdfBuffer);
+
+    // Public filename (stable, easy to share):
+    // evegah-receipt-<receiptNumber>-<mobile>-<DD_MM_YYYY>.pdf
+    const mobileForFile = toDigits(formData?.mobile || formData?.phone || toDigitsValue, 10);
+    const receiptNumberForFile = safeFilePart(receiptNumber, 60) || safeFilePart(receiptId, 30);
+    const dateSource = (() => {
+      const v = formData?.agreementDate || formData?.rentalStart || formData?.rental_start;
+      if (!v) return new Date();
+      const d = new Date(v);
+      return Number.isNaN(d.getTime()) ? new Date() : d;
+    })();
+    const dd = String(dateSource.getDate()).padStart(2, "0");
+    const mm = String(dateSource.getMonth() + 1).padStart(2, "0");
+    const yyyy = String(dateSource.getFullYear());
+    const datePart = `${dd}_${mm}_${yyyy}`;
+
+    const publicBase = safeFilePart(
+      `evegah-receipt-${receiptNumberForFile}-${mobileForFile}-${datePart}`,
+      140
+    ) || `evegah-receipt-${safeFilePart(receiptId, 40)}`;
+
+    let fileName = `${publicBase}.pdf`;
+    let absPath = path.join(uploadsDir, fileName);
+
+    // Avoid overwriting an existing public filename.
+    try {
+      await fs.promises.copyFile(internalAbsPath, absPath, fs.constants.COPYFILE_EXCL);
+    } catch {
+      fileName = `${safeFilePart(publicBase, 110)}_${safeFilePart(receiptId, 20)}.pdf`;
+      absPath = path.join(uploadsDir, fileName);
+      await fs.promises.copyFile(internalAbsPath, absPath).catch(() => null);
+    }
+
+    // Alias using receiptNumber (e.g. RDR-YYYYMM-XXXXXX) so templates can use {{1}} safely.
+    const altKey = safeFilePart(receiptNumber, 80);
+    if (altKey && altKey !== receiptId) {
+      const altFileName = `receipt_${altKey}.pdf`;
+      const altAbsPath = path.join(uploadsDir, altFileName);
+      fs.promises.copyFile(internalAbsPath, altAbsPath).catch(() => null);
+    }
+
+    const mediaUrl = publicUploadsPrefix
+      ? `${publicUploadsPrefix}/${encodeURIComponent(fileName)}`
+      : "";
+
+    const mediaPath = (() => {
+      if (!mediaUrl) return "";
+      try {
+        const u = new URL(mediaUrl);
+        return `${u.pathname}${u.search || ""}`;
+      } catch {
+        return mediaUrl;
+      }
+    })();
+
+    let mediaCheck = null;
+
+    // Preflight: Meta must be able to fetch this URL from the public internet.
+    // Without this, Meta may accept the send request but the user won't receive the document.
+    // Only applies when we are using link-based media delivery.
+    if (fetchApi && mediaUrl) {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 6000);
+      try {
+        const mediaRes = await fetchApi(mediaUrl, {
+          method: "GET",
+          redirect: "follow",
+          headers: {
+            // Keep it small; we only need to confirm the URL is reachable.
+            Range: "bytes=0-0",
+          },
+          signal: controller.signal,
+        });
+        mediaCheck = {
+          ok: mediaRes.ok,
+          status: mediaRes.status,
+          contentType: String(mediaRes.headers?.get?.("content-type") || ""),
+        };
+        if (!mediaRes.ok) {
+          return res.status(200).json({
+            sent: false,
+            mediaUrl,
+            reason: `Receipt URL is not publicly reachable (HTTP ${mediaRes.status}). Check PUBLIC_BASE_URL / PUBLIC_UPLOADS_PREFIX / proxy rules.`,
+            mediaCheck,
+            fallback: null,
+          });
+        }
+      } catch (e) {
+        const msg = String(e?.name === "AbortError" ? "Timeout" : (e?.message || e));
+        mediaCheck = { ok: false, error: msg };
+        return res.status(200).json({
+          sent: false,
+          mediaUrl,
+          reason: `Receipt URL preflight failed: ${msg}`,
+          mediaCheck,
+          fallback: null,
+        });
+      } finally {
+        clearTimeout(timeout);
+      }
+    }
+
+    if (!whatsappPhoneNumberId || !whatsappAccessToken) {
+      return res.status(200).json({
+        sent: false,
+        mediaUrl,
+        reason: "WhatsApp Cloud API not configured",
+        fallback: "manual",
+      });
+    }
+    if (!fetchApi) {
+      return res.status(503).json({
+        sent: false,
+        mediaUrl,
+        reason: "Node fetch API unavailable",
+      });
+    }
+
+    const riderName = formData?.fullName || "Rider";
+    const messageBody = `Hello ${riderName},\nYour EVegah receipt is attached (PDF).`;
+    const graphVersionRaw = String(
+      process.env.WHATSAPP_GRAPH_VERSION || process.env.WHATSAPP_VERSION || "21.0"
+    ).trim();
+    // Meta Graph API expects versions like "v18.0" (leading 'v').
+    const graphVersion = graphVersionRaw.toLowerCase().startsWith("v")
+      ? graphVersionRaw
+      : `v${graphVersionRaw}`;
+    const apiUrl = `https://graph.facebook.com/${graphVersion}/${encodeURIComponent(whatsappPhoneNumberId)}/messages`;
+
+    // If we are sending a template with a document header, prefer uploading the PDF to WhatsApp
+    // and using the returned media id. This is more reliable than passing a public link for
+    // template header media across environments.
+    let templateHeaderMediaId = null;
+    let templateHeaderMediaUpload = null;
+
+    // Restore template-based sending with document attachment if configured
+    const templateName = String(process.env.WHATSAPP_TEMPLATE_NAME || "").trim();
+    const templateLanguage = String(process.env.WHATSAPP_TEMPLATE_LANGUAGE || "en_US").trim();
+    const templateBodyParams = String(process.env.WHATSAPP_TEMPLATE_BODY_PARAMS || "").trim();
+    const templateHeaderType = String(process.env.WHATSAPP_TEMPLATE_HEADER_TYPE || "").trim().toLowerCase();
+    const templateUrlButtonIndexRaw = String(process.env.WHATSAPP_TEMPLATE_URL_BUTTON_INDEX || "").trim();
+    const templateUrlButtonValueKey = String(
+      process.env.WHATSAPP_TEMPLATE_URL_BUTTON_VALUE_KEY || "mediaUrl"
+    ).trim();
+
+    const getTemplateValue = (values, key) => {
+      const k = String(key || "").trim();
+      if (!k) return "";
+      if (values[k] !== undefined && values[k] !== null) return String(values[k]);
+
+      // Try case-insensitive lookup to tolerate env typos like "receiptid" vs "receiptId".
+      const lower = k.toLowerCase();
+      for (const [vk, vv] of Object.entries(values)) {
+        if (String(vk).toLowerCase() === lower) return String(vv ?? "");
+      }
+
+      // Common aliases
+      if (lower === "receiptid" || lower === "receipt_id" || lower === "invoice" || lower === "invoiceid") {
+        return String(values.receiptId ?? values.invoiceNo ?? values.invoice_no ?? "");
+      }
+      return "";
+    };
+
+    const basePayload = {
+      messaging_product: "whatsapp",
+      to: `91${toDigitsValue}`,
+    };
+
+    // Template can be used with or without a document header.
+    // - document header => direct PDF attachment via WhatsApp media upload
+    // - no/other header => rely on template body + dynamic URL button for receipt viewing
+
+    const shouldUploadMedia = Boolean(
+      whatsappPhoneNumberId &&
+      whatsappAccessToken &&
+      fetchApi &&
+      typeof FormData !== "undefined" &&
+      typeof Blob !== "undefined"
+    );
+
+    if (shouldUploadMedia && (templateName ? templateHeaderType === "document" : true)) {
+      try {
+        if (!fetchApi) throw new Error("Node fetch API unavailable");
+
+        const mediaUploadUrl = `https://graph.facebook.com/${graphVersion}/${encodeURIComponent(
+          whatsappPhoneNumberId
+        )}/media`;
+
+        const form = new FormData();
+        form.append("messaging_product", "whatsapp");
+        form.append("type", "application/pdf");
+        form.append("file", new Blob([pdfBuffer], { type: "application/pdf" }), fileName);
+
+        const uploadRes = await fetchApi(mediaUploadUrl, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${whatsappAccessToken}`,
+          },
+          body: form,
+        });
+        const uploadBody = await uploadRes.json().catch(() => null);
+
+        if (uploadRes.ok && uploadBody?.id) {
+          templateHeaderMediaId = String(uploadBody.id);
+          templateHeaderMediaUpload = { ok: true, id: templateHeaderMediaId };
+        } else {
+          templateHeaderMediaUpload = {
+            ok: false,
+            status: uploadRes.status,
+            detail: uploadBody,
+          };
+        }
+      } catch (e) {
+        templateHeaderMediaUpload = { ok: false, reason: String(e?.message || e || "Upload failed") };
+      }
+    }
+
+    // If template uses a document header, require media upload to succeed.
+    if (templateName && templateHeaderType === "document" && !templateHeaderMediaId) {
+      return res.status(200).json({
+        sent: false,
+        mediaUrl,
+        reason: "Failed to upload receipt PDF to WhatsApp media. Cannot send direct attachment via template header.",
+        fallback: null,
+        templateHeaderMediaUpload,
+      });
+    }
+
+    // WhatsApp Cloud API: business-initiated messages generally require a template.
+    // If WHATSAPP_TEMPLATE_NAME is provided, we send a template.
+    // Header is optional and must match your approved template (common cause of failures).
+    // Otherwise we try a session document message.
+    const payload = templateName
+      ? {
+        ...basePayload,
+        type: "template",
+        template: {
+          name: templateName,
+          language: { code: templateLanguage || "en_US" },
+          components: (() => {
+            const components = [];
+
+            // Optional template header (must match exactly what Meta template expects)
+            // Supported: "document" (uses the receipt URL) or "text".
+            if (templateHeaderType === "document") {
+              components.push({
+                type: "header",
+                parameters: [
+                  {
+                    type: "document",
+                    document: {
+                      ...(templateHeaderMediaId ? { id: templateHeaderMediaId } : { link: mediaUrl }),
+                      filename: fileName,
+                    },
+                  },
+                ],
+              });
+            } else if (templateHeaderType === "text") {
+              components.push({
+                type: "header",
+                parameters: [
+                  {
+                    type: "text",
+                    text: String(process.env.WHATSAPP_TEMPLATE_HEADER_TEXT || ""),
+                  },
+                ],
+              });
+            }
+
+            // Optional body parameters (map keys to values)
+            const bodyKeys = templateBodyParams
+              ? templateBodyParams.split(",").map((s) => s.trim()).filter(Boolean)
+              : [];
+
+            // Meta Cloud API template components are position-based: parameters are matched by order.
+            // Some UI surfaces show "variable names" (e.g. {{name}}), but the API still expects
+            // ordered parameters. Only enable `parameter_name` if you explicitly know your template
+            // requires it.
+            const templateParamModeRaw = String(process.env.WHATSAPP_TEMPLATE_PARAM_MODE || "positional")
+              .trim()
+              .toLowerCase();
+            const useNamedParams = templateParamModeRaw === "named";
+
+            // Try to derive amount if present
+            const amount = (() => {
+              if (resolvedAmountText) return resolvedAmountText;
+              const candidates = [
+                formData?.amountPaid,
+                formData?.paidAmount,
+                formData?.paymentDetails?.totalAmount,
+                formData?.totalAmount,
+                formData?.amount,
+              ];
+              const positive = firstPositiveMoneyValue(candidates);
+              if (positive !== null) return formatMoneyCompact(positive);
+              const any = firstAnyMoneyValue(candidates);
+              return any === null ? "" : formatMoneyCompact(any);
+            })();
+
+            const paymentMode =
+              formData?.paymentMode ??
+              formData?.payment_method ??
+              formData?.paymentMethod ??
+              "";
+
+            const invoiceDateSource = (() => {
+              const v = formData?.rentalStart ?? formData?.rental_start ?? formData?.start_time;
+              if (!v) return new Date();
+              const d = new Date(v);
+              return Number.isNaN(d.getTime()) ? new Date() : d;
+            })();
+
+            const invoiceDate = (() => {
+              const format = String(process.env.WHATSAPP_TEMPLATE_INVOICE_DATE_FORMAT || "DD/MM/YYYY")
+                .trim()
+                .toUpperCase();
+              const d = invoiceDateSource;
+              const dd = String(d.getDate()).padStart(2, "0");
+              const mm = String(d.getMonth() + 1).padStart(2, "0");
+              const yyyy = String(d.getFullYear());
+              if (format === "YYYY-MM-DD") return `${yyyy}-${mm}-${dd}`;
+              if (format === "DD-MM-YYYY") return `${dd}-${mm}-${yyyy}`;
+              if (format === "DDMMYYYY") return `${dd}${mm}${yyyy}`;
+              if (format === "DD/MM/YYYY") return `${dd}/${mm}/${yyyy}`;
+              // Default: DD/MM/YYYY
+              return `${dd}/${mm}/${yyyy}`;
+            })();
+
+            const plan =
+              formData?.rentalPackage ??
+              formData?.rental_package ??
+              formData?.planName ??
+              formData?.plan ??
+              formData?.subscriptionPlan ??
+              "";
+
+            const hub = formData?.operationalZone ?? formData?.zone ?? "";
+            const vehicleType =
+              formData?.bikeModel ??
+              formData?.vehicleType ??
+              formData?.vehicle_type ??
+              "";
+
+            if (bodyKeys.length) {
+              // If the template is using positional variables ({{1}}, {{2}}, ...), map
+              // the first 5 values in the expected order.
+              const isNumericKeys = bodyKeys.every((k) => /^\d+$/.test(k));
+
+              const values = {
+                name: riderName,
+                riderName,
+                receiptId,
+                receiptNumber,
+                registrationId: receiptId,
+                mediaUrl,
+                mediaPath,
+                mediaPathNoSlash: String(mediaPath || "").replace(/^\/+/, ""),
+                messageBody,
+                amount: String(amount ?? ""),
+                paymentMode: String(paymentMode ?? ""),
+                hub: String(hub ?? ""),
+                vehicleType: String(vehicleType ?? ""),
+                phone: `91${toDigitsValue}`,
+                invoiceNo: receiptId,
+                invoice_no: receiptId,
+                invoiceDate,
+                invoice_date: invoiceDate,
+                plan: String(plan ?? ""),
+                fileName,
+              };
+
+              const positionalValues = [
+                riderName,
+                receiptNumber,
+                invoiceDate,
+                String(plan ?? ""),
+                String(amount ?? ""),
+              ];
+
+              components.push({
+                type: "body",
+                parameters: bodyKeys.map((key, idx) => {
+                  const text = isNumericKeys && !useNamedParams
+                    ? String(positionalValues[idx] ?? "")
+                    : String(values[key] ?? "");
+                  return {
+                    type: "text",
+                    text,
+                    ...(useNamedParams ? { parameter_name: key } : {}),
+                  };
+                }),
+              });
+            }
+
+            // Optional URL button parameter (for templates with a dynamic URL button)
+            // Example: WHATSAPP_TEMPLATE_URL_BUTTON_INDEX=0 and the template URL is like https://.../{{1}}
+            if (templateUrlButtonIndexRaw) {
+              const index = Number.parseInt(templateUrlButtonIndexRaw, 10);
+              if (Number.isFinite(index) && index >= 0) {
+                const defaultButtonUrlParam =
+                  String(mediaPath || "").replace(/^\/+/, "") ||
+                  (() => {
+                    try {
+                      const u = new URL(String(mediaUrl || ""));
+                      return `${u.pathname || ""}${u.search || ""}`.replace(/^\/+/, "");
+                    } catch {
+                      return String(mediaUrl || "").replace(/^\/+/, "");
+                    }
+                  })();
+
+                const buttonValue = (() => {
+                  const values = {
+                    name: riderName,
+                    riderName,
+                    receiptId,
+                    receiptNumber,
+                    registrationId: receiptId,
+                    mediaUrl,
+                    mediaPath,
+                    mediaPathNoSlash: String(mediaPath || "").replace(/^\/+/, ""),
+                    messageBody,
+                    amount: String(amount ?? ""),
+                    paymentMode: String(paymentMode ?? ""),
+                    hub: String(hub ?? ""),
+                    vehicleType: String(vehicleType ?? ""),
+                    phone: `91${toDigitsValue}`,
+                    invoiceNo: receiptId,
+                    invoice_no: receiptId,
+                    invoiceDate,
+                    invoice_date: invoiceDate,
+                    plan: String(plan ?? ""),
+                    fileName,
+                  };
+
+                  const raw = getTemplateValue(values, templateUrlButtonValueKey);
+                  const keyLower = String(templateUrlButtonValueKey || "").trim().toLowerCase();
+
+                  // For dynamic URL buttons, WhatsApp templates typically use a fixed base URL
+                  // and expect only a variable suffix in {{1}}. If the configured key resolves
+                  // to a full media URL, convert it to path-without-leading-slash.
+                  if ((keyLower === "mediaurl" || keyLower === "url" || keyLower === "link") && raw) {
+                    try {
+                      const u = new URL(String(raw));
+                      const suffix = `${u.pathname || ""}${u.search || ""}`.replace(/^\/+/, "");
+                      if (suffix) return suffix;
+                    } catch {
+                      // ignore parse errors and fall back to raw value
+                    }
+                    return String(raw).replace(/^\/+/, "");
+                  }
+
+                  // If requested key doesn't resolve, use receipt path param by default.
+                  if (!String(raw || "").trim()) return defaultButtonUrlParam;
+                  return raw;
+                })();
+
+                // If the template has a dynamic URL button, Meta requires a parameter.
+                // Fail fast with a clear message rather than sending an invalid request.
+                if (!buttonValue) {
+                  throw new Error(
+                    "Template URL button parameter is empty. Ensure PUBLIC_BASE_URL/PUBLIC_UPLOADS_PREFIX are configured and WHATSAPP_TEMPLATE_URL_BUTTON_VALUE_KEY maps to media path."
+                  );
+                } else {
+                  components.push({
+                    type: "button",
+                    sub_type: "url",
+                    index: String(index),
+                    // Dynamic URL buttons use a single placeholder (often {{1}}).
+                    parameters: [
+                      {
+                        type: "text",
+                        text: buttonValue,
+                        ...(useNamedParams ? { parameter_name: "1" } : {}),
+                      },
+                    ],
+                  });
+                }
+              }
+            }
+
+            return components.length ? components : undefined;
+          })(),
+        },
+      }
+      : {
+        ...basePayload,
+        type: "document",
+        document: {
+          ...(templateHeaderMediaId ? { id: templateHeaderMediaId } : { link: mediaUrl }),
+          filename: fileName,
+          caption: messageBody,
+        },
+      };
+
+    if (payload?.type === "document" && !templateHeaderMediaId && !mediaUrl) {
+      return res.status(200).json({
+        sent: false,
+        mediaUrl: null,
+        reason: "Cannot attach receipt: WhatsApp media upload failed and PUBLIC_BASE_URL is not configured for link-based delivery.",
+        fallback: null,
+        templateHeaderMediaUpload,
+      });
+    }
+
+    // If we ended up with template.components === undefined, remove it entirely (Meta is picky).
+    if (payload?.type === "template" && payload?.template && payload.template.components === undefined) {
+      delete payload.template.components;
+    }
+
+    const response = await fetchApi(apiUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${whatsappAccessToken}`,
+      },
+      body: JSON.stringify(payload),
+    });
+    const responseBody = await response.json().catch(() => null);
+    if (!response.ok) {
+      const metaError = responseBody?.error;
+      const metaMessage =
+        (metaError && typeof metaError.message === "string" && metaError.message.trim())
+          ? metaError.message.trim()
+          : "WhatsApp Cloud API rejected the request";
+
+      console.error("WhatsApp Cloud API error", {
+        status: response.status,
+        meta: metaError || responseBody,
+        apiUrl,
+        graphVersion,
+        whatsappPhoneNumberId,
+        templateName: templateName || null,
+        to: `91${toDigitsValue}`,
+        mediaUrl,
+        payloadSummary: {
+          type: payload?.type || null,
+          hasTemplate: payload?.type === "template",
+          bodyParamCount: Array.isArray(payload?.template?.components)
+            ? (payload.template.components.find((c) => c?.type === "body")?.parameters?.length || 0)
+            : 0,
+          bodyParamNames: Array.isArray(payload?.template?.components)
+            ? (payload.template.components.find((c) => c?.type === "body")?.parameters || [])
+              .map((p) => p?.parameter_name)
+              .filter(Boolean)
+            : [],
+          buttonUrlParamText: Array.isArray(payload?.template?.components)
+            ? (payload.template.components.find((c) => c?.type === "button" && c?.sub_type === "url")
+              ?.parameters?.[0]?.text || "")
+            : "",
+          buttonUrlIndex: Array.isArray(payload?.template?.components)
+            ? (payload.template.components.find((c) => c?.type === "button" && c?.sub_type === "url")
+              ?.index || null)
+            : null,
+        },
+      });
+
+      // Return HTTP 200 so the client can gracefully fall back to opening WhatsApp
+      // with the receipt link (e.g., via wa.me) instead of treating this as a hard
+      // transport error.
+      return res.status(200).json({
+        sent: false,
+        reason: `Failed to send WhatsApp receipt: ${metaMessage}`,
+        error: `Failed to send WhatsApp receipt: ${metaMessage}`,
+        providerStatus: response.status,
+        detail: metaError || responseBody,
+        fallback: null,
+        debug: {
+          apiUrl,
+          graphVersion,
+          whatsappPhoneNumberId,
+          templateName: templateName || null,
+          to: `91${toDigitsValue}`,
+          mediaUrl,
+          payloadSummary: {
+            type: payload?.type || null,
+            hasTemplate: payload?.type === "template",
+            bodyParamCount: Array.isArray(payload?.template?.components)
+              ? (payload.template.components.find((c) => c?.type === "body")?.parameters?.length || 0)
+              : 0,
+            bodyParamNames: Array.isArray(payload?.template?.components)
+              ? (payload.template.components.find((c) => c?.type === "body")?.parameters || [])
+                .map((p) => p?.parameter_name)
+                .filter(Boolean)
+              : [],
+            buttonUrlParamText: Array.isArray(payload?.template?.components)
+              ? (payload.template.components.find((c) => c?.type === "button" && c?.sub_type === "url")
+                ?.parameters?.[0]?.text || "")
+              : "",
+            buttonUrlIndex: Array.isArray(payload?.template?.components)
+              ? (payload.template.components.find((c) => c?.type === "button" && c?.sub_type === "url")
+                ?.index || null)
+              : null,
+          },
+        },
+        mediaUrl,
+        mediaCheck,
+        templateHeaderMediaUpload,
+      });
+    }
+
+    return res.status(200).json({
+      sent: true,
+      result: responseBody,
+      mediaUrl,
+      mediaCheck,
+      fallback: null,
+      templateHeaderMediaUpload,
+      warning: !templateName
+        ? "No WhatsApp template configured (WHATSAPP_TEMPLATE_NAME). Business-initiated messages may not be delivered unless the user has an active 24-hour session."
+        : null,
+      debug: {
+        apiUrl,
+        graphVersion,
+        whatsappPhoneNumberId,
+        templateName: templateName || null,
+        to: `91${toDigitsValue}`,
+      },
+    });
+  } catch (e) {
+    console.error("WhatsApp send failed", e);
+    return res.status(500).json({ error: "Failed to send WhatsApp receipt" });
+  }
+});
+
+// ------------------------------
+// Local Postgres APIs (replace Supabase)
+// ------------------------------
+
+function toFiniteNumber(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function parseMaybeArray(value) {
+  if (!value) return [];
+  if (Array.isArray(value)) return value;
+  if (typeof value === "string") {
+    try {
+      const parsed = JSON.parse(value);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  }
+  return [];
+}
+
+function parseTelemetryPoint(entry) {
+  if (!entry || typeof entry !== "object") return null;
+
+  const lat = toFiniteNumber(
+    entry.latitude ?? entry.lat ?? entry.current_latitude ?? entry.ride_start_latitude ?? entry.ride_end_latitude
+  );
+  const lng = toFiniteNumber(
+    entry.longitude ?? entry.lng ?? entry.lon ?? entry.current_longitude ?? entry.ride_start_longitude ?? entry.ride_end_longitude
+  );
+
+  if (lat === null || lng === null) return null;
+  if (lat === 0 && lng === 0) return null;
+
+  const timestampValue =
+    entry.ts ??
+    entry.timestamp ??
+    entry.created_at ??
+    entry.createdon_date ??
+    entry.updatedon_date ??
+    entry.lastupdateddateforlatlong ??
+    entry.lastupdateddateforbatterypercentage ??
+    null;
+
+  const timestamp = timestampValue ? new Date(timestampValue).toISOString() : null;
+
+  return {
+    lat,
+    lng,
+    ts: timestamp,
+  };
+}
+
+function parseTelemetryPath(value) {
+  const points = parseMaybeArray(value)
+    .map((entry) => parseTelemetryPoint(entry))
+    .filter(Boolean);
+
+  const deduped = [];
+  for (const point of points) {
+    const previous = deduped[deduped.length - 1];
+    if (
+      previous &&
+      Math.abs(previous.lat - point.lat) < 0.000001 &&
+      Math.abs(previous.lng - point.lng) < 0.000001
+    ) {
+      continue;
+    }
+    deduped.push(point);
+  }
+
+  return deduped;
+}
+
+function normalizeIotVehicleId(value) {
+  return String(value || "").trim();
+}
+
+function normalizeIotVehicleStatus(speedValue, lockStatusValue) {
+  const speed = toFiniteNumber(speedValue);
+  if (speed !== null && speed > 0) return "in_use";
+  const lockStatus = String(lockStatusValue || "").trim();
+  if (lockStatus === "1") return "available";
+  if (lockStatus === "2") return "inactive";
+  return "available";
+}
+
+async function tableExists(client, schemaName, tableName) {
+  const { rows } = await client.query(
+    "select to_regclass($1) as regclass",
+    [`${schemaName}.${tableName}`]
+  );
+  return Boolean(rows?.[0]?.regclass);
+}
+
+function clampDateRange(fromDate, toDate) {
+  const now = new Date();
+  const to = toDate instanceof Date && !Number.isNaN(toDate.getTime()) ? toDate : now;
+  const fromFallback = new Date(to.getTime() - 1000 * 60 * 60 * 24 * 30);
+  const from = fromDate instanceof Date && !Number.isNaN(fromDate.getTime()) ? fromDate : fromFallback;
+  if (from > to) return { from: to, to: from };
+  return { from, to };
+}
+
+app.get("/api/admin/analytics/fleet", requireAdmin, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const query = req.query || {};
+    const rawFrom = query.from ? new Date(String(query.from)) : null;
+    const rawTo = query.to ? new Date(String(query.to)) : null;
+    const { from, to } = clampDateRange(rawFrom, rawTo);
+    const rideStatus = Number(query.rideStatus || 15);
+
+    const hasPayments = await tableExists(client, "admin", "tbl_payment_transaction_details");
+    const hasAreas = await tableExists(client, "masters", "tbl_area");
+    const hasMapCities = await tableExists(client, "masters", "tbl_map_city");
+    const hasLockDetail = await tableExists(client, "inventory", "tbl_lock_detail");
+
+    const ridesByDayQ = client.query(
+      `select date_trunc('day', createdon_date) as bucket, count(*)::int as rides
+       from admin.tbl_ride_booking
+       where createdon_date >= $1 and createdon_date <= $2
+         and bike_rideing_status = $3
+       group by 1
+       order by 1;`,
+      [from, to, rideStatus]
+    );
+
+    const ridesByWeekQ = client.query(
+      `select date_trunc('week', createdon_date) as bucket, count(*)::int as rides
+       from admin.tbl_ride_booking
+       where createdon_date >= $1 and createdon_date <= $2
+         and bike_rideing_status = $3
+       group by 1
+       order by 1;`,
+      [from, to, rideStatus]
+    );
+
+    const ridesByMonthQ = client.query(
+      `select date_trunc('month', createdon_date) as bucket, count(*)::int as rides
+       from admin.tbl_ride_booking
+       where createdon_date >= $1 and createdon_date <= $2
+         and bike_rideing_status = $3
+       group by 1
+       order by 1;`,
+      [from, to, rideStatus]
+    );
+
+    const revenueTotalQ = hasPayments
+      ? client.query(
+        `select coalesce(sum(coalesce(tblpay.amount, rb.total_ride_amount)), 0) as total
+         from admin.tbl_ride_booking rb
+         left join admin.tbl_payment_transaction_details tblpay on tblpay.id = rb.payment_id
+         where rb.createdon_date >= $1 and rb.createdon_date <= $2
+           and rb.bike_rideing_status = $3;`,
+        [from, to, rideStatus]
+      )
+      : client.query(
+        `select coalesce(sum(rb.total_ride_amount), 0) as total
+         from admin.tbl_ride_booking rb
+         where rb.createdon_date >= $1 and rb.createdon_date <= $2
+           and rb.bike_rideing_status = $3;`,
+        [from, to, rideStatus]
+      );
+
+    const revenueByVehicleQ = hasPayments
+      ? client.query(
+        `select rb.vehicle_lock_id as lock_id,
+                coalesce(ld.lock_number, '') as lock_number,
+                coalesce(sum(coalesce(tblpay.amount, rb.total_ride_amount)), 0) as revenue
+         from admin.tbl_ride_booking rb
+         left join inventory.tbl_lock_detail ld on ld.id = rb.vehicle_lock_id
+         left join admin.tbl_payment_transaction_details tblpay on tblpay.id = rb.payment_id
+         where rb.createdon_date >= $1 and rb.createdon_date <= $2
+           and rb.bike_rideing_status = $3
+         group by 1,2
+         order by revenue desc;`,
+        [from, to, rideStatus]
+      )
+      : client.query(
+        `select rb.vehicle_lock_id as lock_id,
+                coalesce(ld.lock_number, '') as lock_number,
+                coalesce(sum(rb.total_ride_amount), 0) as revenue
+         from admin.tbl_ride_booking rb
+         left join inventory.tbl_lock_detail ld on ld.id = rb.vehicle_lock_id
+         where rb.createdon_date >= $1 and rb.createdon_date <= $2
+           and rb.bike_rideing_status = $3
+         group by 1,2
+         order by revenue desc;`,
+        [from, to, rideStatus]
+      );
+
+    const utilizationByVehicleQ = client.query(
+      `select rb.vehicle_lock_id as lock_id,
+              coalesce(ld.lock_number, '') as lock_number,
+              coalesce(sum(rb.actual_ride_min), 0) as active_minutes
+       from admin.tbl_ride_booking rb
+       left join inventory.tbl_lock_detail ld on ld.id = rb.vehicle_lock_id
+       where rb.createdon_date >= $1 and rb.createdon_date <= $2
+         and rb.bike_rideing_status = $3
+       group by 1,2
+       order by active_minutes desc;`,
+      [from, to, rideStatus]
+    );
+
+    const batteryDrainQ = client.query(
+      `select rb.vehicle_lock_id as lock_id,
+              coalesce(ld.lock_number, '') as lock_number,
+              avg((rb.ride_start_ext_battery_percentage - rb.ride_end_ext_battery_percentage) / nullif(rb.distance_in_meters / 1000.0, 0)) as drain_per_km,
+              max(ld.battery) as battery_percent
+       from admin.tbl_ride_booking rb
+       left join inventory.tbl_lock_detail ld on ld.id = rb.vehicle_lock_id
+       where rb.createdon_date >= $1 and rb.createdon_date <= $2
+         and rb.bike_rideing_status = $3
+         and rb.distance_in_meters > 0
+         and rb.ride_start_ext_battery_percentage is not null
+         and rb.ride_end_ext_battery_percentage is not null
+         and rb.ride_start_ext_battery_percentage >= rb.ride_end_ext_battery_percentage
+       group by 1,2
+       order by drain_per_km desc nulls last;`,
+      [from, to, rideStatus]
+    );
+
+    const topAreasQ = hasAreas
+      ? client.query(
+        `select rb.area_id as area_id,
+                coalesce(ar.name, '') as area_name,
+                count(*)::int as rides
+         from admin.tbl_ride_booking rb
+         left join masters.tbl_area ar on ar.id = rb.area_id
+         where rb.createdon_date >= $1 and rb.createdon_date <= $2
+           and rb.area_id is not null
+         group by 1,2
+         order by rides desc
+         limit 10;`,
+        [from, to]
+      )
+      : Promise.resolve({ rows: [] });
+
+    const topCitiesQ = hasMapCities
+      ? client.query(
+        `select rb.map_city_id as map_city_id,
+                coalesce(mc.map_city_name, '') as map_city_name,
+                count(*)::int as rides
+         from admin.tbl_ride_booking rb
+         left join masters.tbl_map_city mc on mc.map_city_id = rb.map_city_id
+         where rb.createdon_date >= $1 and rb.createdon_date <= $2
+           and rb.map_city_id is not null
+         group by 1,2
+         order by rides desc
+         limit 10;`,
+        [from, to]
+      )
+      : Promise.resolve({ rows: [] });
+
+    const startHotspotsQ = client.query(
+      `select round(rb.ride_start_latitude::numeric, 3) as lat,
+              round(rb.ride_start_longitude::numeric, 3) as lng,
+              count(*)::int as rides
+       from admin.tbl_ride_booking rb
+       where rb.createdon_date >= $1 and rb.createdon_date <= $2
+         and rb.ride_start_latitude is not null
+         and rb.ride_start_longitude is not null
+       group by 1,2
+       order by rides desc
+       limit 20;`,
+      [from, to]
+    );
+
+    const endHotspotsQ = client.query(
+      `select round(rb.ride_end_latitude::numeric, 3) as lat,
+              round(rb.ride_end_longitude::numeric, 3) as lng,
+              count(*)::int as rides
+       from admin.tbl_ride_booking rb
+       where rb.createdon_date >= $1 and rb.createdon_date <= $2
+         and rb.ride_end_latitude is not null
+         and rb.ride_end_longitude is not null
+       group by 1,2
+       order by rides desc
+       limit 20;`,
+      [from, to]
+    );
+
+    const idleHeatmapQ = hasLockDetail
+      ? client.query(
+        `select round(ld.latitude::numeric, 3) as lat,
+                round(ld.longitude::numeric, 3) as lng,
+                count(*)::int as vehicles
+         from inventory.tbl_lock_detail ld
+         where ld.latitude is not null
+           and ld.longitude is not null
+           and coalesce(ld.speed, 0) <= 0.5
+           and coalesce(ld.lastupdateddateforlatlong, ld.device_last_request_time) >= (now() - interval '30 minutes')
+         group by 1,2
+         order by vehicles desc
+         limit 50;`
+      )
+      : Promise.resolve({ rows: [] });
+
+    const [
+      ridesByDay,
+      ridesByWeek,
+      ridesByMonth,
+      revenueTotal,
+      revenueByVehicle,
+      utilizationByVehicle,
+      batteryDrain,
+      topAreas,
+      topCities,
+      startHotspots,
+      endHotspots,
+      idleHeatmap,
+    ] = await Promise.all([
+      ridesByDayQ,
+      ridesByWeekQ,
+      ridesByMonthQ,
+      revenueTotalQ,
+      revenueByVehicleQ,
+      utilizationByVehicleQ,
+      batteryDrainQ,
+      topAreasQ,
+      topCitiesQ,
+      startHotspotsQ,
+      endHotspotsQ,
+      idleHeatmapQ,
+    ]);
+
+    const periodMinutes = Math.max(1, Math.round((to.getTime() - from.getTime()) / 60000));
+    const utilizationRows = utilizationByVehicle.rows.map((row) => {
+      const activeMinutes = Number(row.active_minutes || 0);
+      const utilizationPct = Math.min(100, Number(((activeMinutes / periodMinutes) * 100).toFixed(2)));
+      return {
+        lockId: row.lock_id,
+        lockNumber: row.lock_number,
+        activeMinutes,
+        utilizationPct,
+      };
+    });
+
+    const drainRows = batteryDrain.rows.map((row) => {
+      const drainPerKm = Number(row.drain_per_km || 0);
+      const batteryPercent = Number(row.battery_percent || 0);
+      const estimatedRangeKm = drainPerKm > 0 ? Number((batteryPercent / drainPerKm).toFixed(1)) : null;
+      return {
+        lockId: row.lock_id,
+        lockNumber: row.lock_number,
+        avgDrainPerKm: drainPerKm > 0 ? Number(drainPerKm.toFixed(3)) : null,
+        batteryPercent: Number.isFinite(batteryPercent) ? batteryPercent : null,
+        estimatedRangeKm,
+      };
+    });
+
+    const drainValues = drainRows.map((row) => row.avgDrainPerKm).filter((value) => Number.isFinite(value) && value > 0);
+    const fleetAvgDrain = drainValues.length
+      ? Number((drainValues.reduce((sum, value) => sum + value, 0) / drainValues.length).toFixed(3))
+      : null;
+
+    const lowBatteryList = drainRows
+      .filter((row) => Number.isFinite(row.batteryPercent) && row.batteryPercent <= 25)
+      .sort((a, b) => Number(a.batteryPercent || 0) - Number(b.batteryPercent || 0));
+
+    res.json({
+      generatedAt: new Date().toISOString(),
+      range: { from: from.toISOString(), to: to.toISOString() },
+      rides: {
+        byDay: ridesByDay.rows.map((row) => ({ date: row.bucket, rides: Number(row.rides || 0) })),
+        byWeek: ridesByWeek.rows.map((row) => ({ week: row.bucket, rides: Number(row.rides || 0) })),
+        byMonth: ridesByMonth.rows.map((row) => ({ month: row.bucket, rides: Number(row.rides || 0) })),
+      },
+      revenue: {
+        total: Number(revenueTotal.rows[0]?.total || 0),
+        byVehicle: revenueByVehicle.rows.map((row) => ({
+          lockId: row.lock_id,
+          lockNumber: row.lock_number,
+          revenue: Number(row.revenue || 0),
+        })),
+      },
+      utilization: {
+        averagePct: utilizationRows.length
+          ? Number((utilizationRows.reduce((sum, row) => sum + row.utilizationPct, 0) / utilizationRows.length).toFixed(2))
+          : 0,
+        byVehicle: utilizationRows,
+      },
+      battery: {
+        avgDrainPerKm: fleetAvgDrain,
+        byVehicle: drainRows,
+        lowBattery: lowBatteryList,
+      },
+      location: {
+        topAreas: topAreas.rows.map((row) => ({ areaId: row.area_id, areaName: row.area_name, rides: Number(row.rides || 0) })),
+        topCities: topCities.rows.map((row) => ({ mapCityId: row.map_city_id, mapCityName: row.map_city_name, rides: Number(row.rides || 0) })),
+        startHotspots: startHotspots.rows.map((row) => ({ lat: Number(row.lat), lng: Number(row.lng), rides: Number(row.rides || 0) })),
+        endHotspots: endHotspots.rows.map((row) => ({ lat: Number(row.lat), lng: Number(row.lng), rides: Number(row.rides || 0) })),
+        idleHeatmap: idleHeatmap.rows.map((row) => ({ lat: Number(row.lat), lng: Number(row.lng), vehicles: Number(row.vehicles || 0) })),
+      },
+    });
+  } catch (error) {
+    res.status(500).json({ error: String(error?.message || error) });
+  } finally {
+    client.release();
+  }
+});
+
+app.get("/api/admin/iot/map", requireAdmin, async (_req, res) => {
+  const client = await pool.connect();
+  try {
+    const query = _req.query || {};
+    const filterStatus = String(query.status || "").trim().toLowerCase();
+    const filterCity = String(query.city || query.mapCityId || "").trim();
+    const filterVehicleId = normalizeIotVehicleId(query.vehicleId || "");
+    const filterBatteryMin = Number(query.batteryMin ?? query.battery_min);
+    const filterBatteryMax = Number(query.batteryMax ?? query.battery_max);
+    const filterFrom = query.from ? new Date(String(query.from)) : null;
+    const filterTo = query.to ? new Date(String(query.to)) : null;
+    const liveDevicesQ = await client.query(
+      `select
+         id,
+         lock_number,
+         latitude,
+         longitude,
+         battery,
+         speed,
+         total_distance_in_meters,
+         device_lock_and_unlock_status,
+         imei_number,
+         map_city_id,
+         area_id,
+         lastupdateddateforlatlong,
+         lastupdateddateforbatterypercentage,
+         device_last_request_time,
+         createdon_date,
+         updatedon_date
+       from inventory.tbl_lock_detail
+       where latitude is not null
+         and longitude is not null
+       order by coalesce(lastupdateddateforlatlong, device_last_request_time, updatedon_date, createdon_date) desc nulls last, id desc`
+    );
+
+    const ridesQ = await client.query(
+      `select
+         rb.id,
+         rb.vehicle_uid_id,
+         rb.vehicle_lock_id,
+         rb.bike_id,
+         rb.createdon_date,
+         rb.updatedon_date,
+         rb.ride_start_latitude,
+         rb.ride_start_longitude,
+         rb.ride_end_latitude,
+         rb.ride_end_longitude,
+         rb.current_latitude,
+         rb.current_longitude,
+         rb.ride_start_ext_battery_percentage,
+         rb.ride_end_ext_battery_percentage,
+         rb.latitude_longitude_json,
+         rb.beepon_latitude_longitude_json,
+         rb.beepoff_latitude_longitude_json,
+         rb.distance_in_meters,
+         vm.model_name,
+         vm.brand_name,
+         vm.color,
+         ld.lock_number,
+         ld.imei_number
+       from admin.tbl_ride_booking rb
+       left join masters.tbl_vehicle_model vm on rb.vehicle_model_id = vm.id
+       left join inventory.tbl_lock_detail ld on rb.vehicle_lock_id = ld.id
+       order by coalesce(rb.updatedon_date, rb.createdon_date) desc nulls last, rb.id desc
+       limit 500`
+    );
+
+    const devices = (liveDevicesQ.rows || []).map((row) => {
+      const vehicleId = normalizeIotVehicleId(row.lock_number || row.imei_number || row.id);
+      const latitude = toFiniteNumber(row.latitude);
+      const longitude = toFiniteNumber(row.longitude);
+      const battery = toFiniteNumber(row.battery);
+      const speed = toFiniteNumber(row.speed);
+
+      return {
+        id: String(row.id),
+        vehicleId,
+        lockNumber: normalizeIotVehicleId(row.lock_number),
+        lat: latitude,
+        lng: longitude,
+        batteryPercent: battery,
+        speedKmh: speed,
+        distanceMeters: toFiniteNumber(row.total_distance_in_meters),
+        status: normalizeIotVehicleStatus(speed, row.device_lock_and_unlock_status),
+        imeiNumber: normalizeIotVehicleId(row.imei_number),
+        mapCityId: row.map_city_id === null ? null : String(row.map_city_id),
+        areaId: row.area_id === null ? null : String(row.area_id),
+        lastUpdatedAt:
+          row.lastupdateddateforlatlong || row.device_last_request_time || row.updatedon_date || row.createdon_date || null,
+        batteryUpdatedAt: row.lastupdateddateforbatterypercentage || null,
+      };
+    });
+
+    const routes = [];
+    const modelsByVehicle = new Map();
+    for (const row of ridesQ.rows || []) {
+      const vehicleKeys = Array.from(
+        new Set(
+          [row.lock_number, row.imei_number, row.bike_id, row.vehicle_uid_id, row.vehicle_lock_id, row.id]
+            .map((value) => normalizeIotVehicleId(value))
+            .filter(Boolean)
+        )
+      );
+      if (!vehicleKeys.length) continue;
+
+      // Store model info for this vehicle
+      const modelInfo = {
+        modelName: row.model_name || null,
+        brandName: row.brand_name || null,
+        color: row.color || null,
+      };
+
+      let points = parseTelemetryPath(row.latitude_longitude_json);
+      if (!points.length) {
+        const fallbackPoints = [
+          {
+            lat: toFiniteNumber(row.ride_start_latitude),
+            lng: toFiniteNumber(row.ride_start_longitude),
+            ts: row.createdon_date ? new Date(row.createdon_date).toISOString() : null,
+          },
+          {
+            lat: toFiniteNumber(row.current_latitude),
+            lng: toFiniteNumber(row.current_longitude),
+            ts: row.updatedon_date || row.createdon_date ? new Date(row.updatedon_date || row.createdon_date).toISOString() : null,
+          },
+          {
+            lat: toFiniteNumber(row.ride_end_latitude),
+            lng: toFiniteNumber(row.ride_end_longitude),
+            ts: row.updatedon_date ? new Date(row.updatedon_date).toISOString() : null,
+          },
+        ].filter((point) => point.lat !== null && point.lng !== null);
+
+        points = fallbackPoints;
+      }
+
+      const beeponPoints = parseTelemetryPath(row.beepon_latitude_longitude_json);
+      const beepoffPoints = parseTelemetryPath(row.beepoff_latitude_longitude_json);
+
+      const route = {
+        id: String(row.id),
+        vehicleId: normalizeIotVehicleId(row.lock_number || row.vehicle_lock_id || row.bike_id || row.vehicle_uid_id || row.id),
+        vehicleKeys,
+        vehicleUidId: row.vehicle_uid_id === null ? null : String(row.vehicle_uid_id),
+        vehicleLockId: row.vehicle_lock_id === null ? null : String(row.vehicle_lock_id),
+        bikeId: row.bike_id === null ? null : String(row.bike_id),
+        lockNumber: normalizeIotVehicleId(row.lock_number),
+        imeiNumber: normalizeIotVehicleId(row.imei_number),
+        points,
+        startPoint: points[0] || null,
+        endPoint: points[points.length - 1] || null,
+        beeponPoints,
+        beepoffPoints,
+        currentLat: toFiniteNumber(row.current_latitude),
+        currentLng: toFiniteNumber(row.current_longitude),
+        distanceMeters: toFiniteNumber(row.distance_in_meters),
+        rideStartBatteryPercent: toFiniteNumber(row.ride_start_ext_battery_percentage),
+        rideEndBatteryPercent: toFiniteNumber(row.ride_end_ext_battery_percentage),
+        source: "admin.tbl_ride_booking",
+        createdAt: row.createdon_date || null,
+        updatedAt: row.updatedon_date || null,
+        modelName: row.model_name || null,
+        brandName: row.brand_name || null,
+        color: row.color || null,
+      };
+
+      routes.push(route);
+
+      for (const key of vehicleKeys) {
+        const normalizedKey = key.toLowerCase();
+        // Store model info for device matching
+        if (!modelsByVehicle.has(normalizedKey)) {
+          modelsByVehicle.set(normalizedKey, modelInfo);
+        }
+      }
+    }
+
+    // Enrich devices with model information from routes
+    const enrichedDevices = devices.map((device) => {
+      const modelInfo = modelsByVehicle.get(device.vehicleId.toLowerCase()) || {};
+      return {
+        ...device,
+        modelName: modelInfo.modelName || null,
+        brandName: modelInfo.brandName || null,
+        color: modelInfo.color || null,
+      };
+    });
+
+    let filteredDevices = enrichedDevices;
+    if (filterStatus && filterStatus !== "all") {
+      filteredDevices = filteredDevices.filter((device) => String(device.status || "").toLowerCase() === filterStatus);
+    }
+    if (Number.isFinite(filterBatteryMin)) {
+      filteredDevices = filteredDevices.filter((device) => Number(device.batteryPercent) >= filterBatteryMin);
+    }
+    if (Number.isFinite(filterBatteryMax)) {
+      filteredDevices = filteredDevices.filter((device) => Number(device.batteryPercent) <= filterBatteryMax);
+    }
+    if (filterCity) {
+      filteredDevices = filteredDevices.filter((device) => String(device.mapCityId || "") === filterCity);
+    }
+    if (filterVehicleId) {
+      filteredDevices = filteredDevices.filter((device) => normalizeIotVehicleId(device.vehicleId) === filterVehicleId);
+    }
+
+    let filteredRoutes = routes;
+    if (filterVehicleId) {
+      filteredRoutes = filteredRoutes.filter((route) =>
+        Array.isArray(route.vehicleKeys) && route.vehicleKeys.some((key) => normalizeIotVehicleId(key) === filterVehicleId)
+      );
+    }
+    if (filterFrom || filterTo) {
+      filteredRoutes = filteredRoutes.filter((route) => {
+        const updated = route.updatedAt ? new Date(route.updatedAt) : null;
+        const created = route.createdAt ? new Date(route.createdAt) : null;
+        const ts = updated || created;
+        if (!ts) return false;
+        if (filterFrom && ts < filterFrom) return false;
+        if (filterTo) {
+          const end = new Date(filterTo);
+          end.setHours(23, 59, 59, 999);
+          if (ts > end) return false;
+        }
+        return true;
+      });
+    }
+
+    res.json({
+      generatedAt: new Date().toISOString(),
+      devices: filteredDevices,
+      routes: filteredRoutes,
+    });
+  } catch (error) {
+    res.status(500).json({ error: String(error?.message || error) });
+  } finally {
+    client.release();
+  }
+});
+
+app.get("/api/v1/iot/mqtt/device/:deviceId/snapshot", requireAdmin, async (req, res) => {
+  try {
+    if (!fetchApi || !iotSnapshotBaseUrl) {
+      return res.json(null);
+    }
+
+    const deviceId = String(req.params.deviceId || "").trim();
+    if (!deviceId) return res.status(400).json({ error: "deviceId required" });
+
+    const upstreamUrl = `${iotSnapshotBaseUrl.replace(/\/$/, "")}/api/v1/iot/mqtt/device/${encodeURIComponent(deviceId)}/snapshot`;
+    const response = await fetchApi(upstreamUrl);
+    if (!response.ok) {
+      return res.json(null);
+    }
+
+    const payload = await response.json().catch(() => null);
+    return res.json(payload || null);
+  } catch (error) {
+    return res.status(500).json({ error: String(error?.message || error) });
+  }
+});
+
+app.get("/api/riders/lookup", async (req, res) => {
+  const mobile = toDigits(req.query.phone || req.query.mobile || "", 10);
+  const aadhaar = toDigits(req.query.aadhaar || "", 12);
+  if (!mobile && !aadhaar) return res.json(null);
+
+  try {
+    const { rows } = await pool.query(
+      `select id, full_name, mobile, aadhaar, gender, dob, status,
+              coalesce(meta->>'rider_code','') as rider_code
+       from public.riders
+       where ($1 <> '' and mobile = $1)
+          or ($2 <> '' and aadhaar = $2)
+       limit 1`,
+      [mobile, aadhaar]
+    );
+    res.json(rows[0] || null);
+  } catch (error) {
+    res.status(500).json({ error: String(error?.message || error) });
+  }
+});
+
+app.get("/api/riders", async (req, res) => {
+  const page = Math.max(1, Number(req.query.page || 1));
+  const limit = Math.min(100, Math.max(1, Number(req.query.limit || 10)));
+  const offset = (page - 1) * limit;
+
+  const search = String(req.query.search || "").trim();
+  const status = String(req.query.status || "all").trim();
+  const rideStatus = String(req.query.rideStatus || "all").trim();
+  const start = req.query.start ? String(req.query.start) : "";
+  const end = req.query.end ? String(req.query.end) : "";
+
+  const where = [];
+  const params = [];
+  const push = (v) => {
+    params.push(v);
+    return `$${params.length}`;
+  };
+
+  if (search) {
+    const p = push(`%${search}%`);
+    where.push(`(full_name ilike ${p} or mobile ilike ${p} or aadhaar ilike ${p})`);
+  }
+  if (status && status !== "all") {
+    where.push(`status = ${push(status)}`);
+  }
+  if (start) {
+    where.push(`created_at >= ${push(start)}`);
+  }
+  if (end) {
+    where.push(`created_at <= ${push(end)}`);
+  }
+
+  // Derived ride status (based on rentals + returns)
+  // - Riding: has at least one active rental (no return record)
+  // - Returned: no active rental, but has returned at least once
+  // - No Ride: no rentals at all
+  if (rideStatus && rideStatus !== "all") {
+    if (rideStatus === "riding") {
+      where.push(`ra.active_rental_id is not null`);
+    } else if (rideStatus === "returned") {
+      where.push(`ra.active_rental_id is null and ra.last_returned_at is not null`);
+    } else if (rideStatus === "no_ride") {
+      where.push(`coalesce(ra.rental_count,0) = 0`);
+    }
+  }
+
+  const whereSql = where.length ? `where ${where.join(" and ")}` : "";
+
+  try {
+    const fromSql = `from public.riders r
+      left join lateral (
+        select
+          (select count(*)::int from public.rentals rr where rr.rider_id = r.id) as rental_count,
+          (select rr2.id
+           from public.rentals rr2
+           where rr2.rider_id = r.id
+             and not exists (select 1 from public.returns rt where rt.rental_id = rr2.id)
+           order by rr2.created_at desc
+           limit 1) as active_rental_id,
+          (select rr2.vehicle_number
+           from public.rentals rr2
+           where rr2.rider_id = r.id
+             and not exists (select 1 from public.returns rt where rt.rental_id = rr2.id)
+           order by rr2.created_at desc
+           limit 1) as active_vehicle_number,
+          (select max(rt.returned_at)
+           from public.returns rt
+           join public.rentals rr3 on rr3.id = rt.rental_id
+           where rr3.rider_id = r.id) as last_returned_at
+      ) ra on true`;
+
+    const countResult = await pool.query(
+      `select count(*)::int as count ${fromSql} ${whereSql}`,
+      params
+    );
+    const totalCount = countResult.rows?.[0]?.count || 0;
+
+    const dataResult = await pool.query(
+      `select r.*,
+              coalesce(r.meta->>'rider_code','') as rider_code,
+              coalesce(ra.rental_count,0) as rental_count,
+              ra.active_rental_id,
+              coalesce(ra.active_vehicle_number,'') as active_vehicle_number,
+              ra.last_returned_at,
+              case
+                when ra.active_rental_id is not null then 'Riding'
+                when ra.last_returned_at is not null then 'Returned'
+                when coalesce(ra.rental_count,0) = 0 then 'No Ride'
+                else 'Returned'
+              end as ride_status,
+              case
+                when coalesce(ra.rental_count,0) > 1 then 'Retain'
+                when coalesce(ra.rental_count,0) = 1 then 'New'
+                else 'New'
+              end as rider_type
+       ${fromSql}
+       ${whereSql}
+       order by r.created_at desc
+       limit ${push(limit)} offset ${push(offset)}`,
+      params
+    );
+
+    res.json({ data: dataResult.rows || [], totalCount });
+  } catch (error) {
+    res.status(500).json({ error: String(error?.message || error) });
+  }
+});
+
+app.get("/api/riders/stats", async (_req, res) => {
+  try {
+    const [
+      totalQ,
+      activeQ,
+      suspendedQ,
+      ridesQ,
+      activeVehiclesQ,
+      retainRidersQ,
+      endedRidesQ,
+      endedRidersQ,
+    ] = await Promise.all([
+      pool.query(`select count(*)::int as count from public.riders`),
+      pool.query(`select count(*)::int as count from public.riders where status='active'`),
+      pool.query(`select count(*)::int as count from public.riders where status='suspended'`),
+      pool.query(`select count(*)::int as count from public.rentals`),
+      pool.query(
+        `select count(distinct nullif(trim(vehicle_number),''))::int as count
+         from public.rentals r
+         where not exists (select 1 from public.returns rt where rt.rental_id = r.id)`
+      ),
+      pool.query(
+        `select count(*)::int as count
+         from (
+           select rider_id
+           from public.rentals
+           group by rider_id
+           having count(*) > 1
+         ) x`
+      ),
+      pool.query(
+        `select count(distinct rental_id)::int as count
+         from public.returns`
+      ),
+      pool.query(
+        `select count(*)::int as count
+         from public.riders rd
+         where not exists (
+           select 1
+           from public.rentals r
+           where r.rider_id = rd.id
+             and not exists (select 1 from public.returns rt where rt.rental_id = r.id)
+         )
+           and exists (
+             select 1
+             from public.rentals r
+             where r.rider_id = rd.id
+               and exists (select 1 from public.returns rt where rt.rental_id = r.id)
+           )`
+      ),
+    ]);
+
+    res.json({
+      totalRiders: totalQ.rows?.[0]?.count || 0,
+      activeRiders: activeQ.rows?.[0]?.count || 0,
+      suspendedRiders: suspendedQ.rows?.[0]?.count || 0,
+      totalRides: ridesQ.rows?.[0]?.count || 0,
+      activeRentedVehicles: activeVehiclesQ.rows?.[0]?.count || 0,
+      retainRiders: retainRidersQ.rows?.[0]?.count || 0,
+      endedRides: endedRidesQ.rows?.[0]?.count || 0,
+      endedRiders: endedRidersQ.rows?.[0]?.count || 0,
+    });
+  } catch (error) {
+    res.status(500).json({ error: String(error?.message || error) });
+  }
+});
+
+app.patch("/api/riders/:id", async (req, res) => {
+  const id = String(req.params.id || "");
+  const body = req.body || {};
+  if (!id) return res.status(400).json({ error: "id required" });
+
+  const fields = {
+    full_name: body.full_name,
+    mobile: body.mobile,
+    aadhaar: body.aadhaar,
+    gender: body.gender,
+    status: body.status,
+    permanent_address: body.permanent_address,
+    temporary_address: body.temporary_address,
+    reference: body.reference,
+  };
+
+  const set = [];
+  const params = [];
+  const push = (v) => {
+    params.push(v);
+    return `$${params.length}`;
+  };
+
+  Object.entries(fields).forEach(([k, v]) => {
+    if (v === undefined) return;
+    set.push(`${k} = ${push(v)}`);
+  });
+
+  if (set.length === 0) return res.json({ ok: true });
+  params.push(id);
+
+  try {
+    const { rows } = await pool.query(
+      `update public.riders set ${set.join(", ")}
+       where id = $${params.length}
+       returning *`,
+      params
+    );
+    res.json(rows[0] || null);
+  } catch (error) {
+    res.status(500).json({ error: String(error?.message || error) });
+  }
+});
+
+app.delete("/api/riders/:id", async (req, res) => {
+  const id = String(req.params.id || "");
+  if (!id) return res.status(400).json({ error: "id required" });
+
+  try {
+    const client = await pool.connect();
+    try {
+      await client.query("begin");
+
+      // Delete battery swaps that belong to this rider's rentals (prevents 'N/A' rows
+      // from lingering in employee battery swap dashboards after rider deletion).
+      const swapsDeleted = await client.query(
+        `delete from public.battery_swaps s
+         where exists (
+           select 1
+           from public.rentals r
+           left join lateral (
+             select max(returned_at) as returned_at
+             from public.returns rt
+             where rt.rental_id = r.id
+           ) ret on true
+           where r.rider_id = $1
+             and regexp_replace(lower(coalesce(r.vehicle_number,'')),'[^a-z0-9]+','','g') =
+                 regexp_replace(lower(coalesce(s.vehicle_number,'')),'[^a-z0-9]+','','g')
+             and r.start_time <= coalesce(s.swapped_at, s.created_at)
+             and (ret.returned_at is null or ret.returned_at > coalesce(s.swapped_at, s.created_at))
+         )`,
+        [id]
+      );
+
+      await client.query(`delete from public.riders where id = $1`, [id]);
+      await client.query("commit");
+      res.json({ ok: true, swapsDeleted: swapsDeleted.rowCount || 0 });
+    } catch (error) {
+      await client.query("rollback");
+      throw error;
+    } finally {
+      client.release();
+    }
+  } catch (error) {
+    res.status(500).json({ error: String(error?.message || error) });
+  }
+});
+
+app.post("/api/riders/bulk-delete", async (req, res) => {
+  const ids = Array.isArray(req.body?.ids)
+    ? req.body.ids.map((id) => String(id || "").trim()).filter(Boolean)
+    : [];
+  if (ids.length === 0) {
+    return res.status(400).json({ error: "ids required" });
+  }
+
+  try {
+    const client = await pool.connect();
+    try {
+      await client.query("begin");
+
+      const swapsDeleted = await client.query(
+        `delete from public.battery_swaps s
+         where exists (
+           select 1
+           from public.rentals r
+           left join lateral (
+             select max(returned_at) as returned_at
+             from public.returns rt
+             where rt.rental_id = r.id
+           ) ret on true
+           where r.rider_id = any($1::uuid[])
+             and regexp_replace(lower(coalesce(r.vehicle_number,'')),'[^a-z0-9]+','','g') =
+                 regexp_replace(lower(coalesce(s.vehicle_number,'')),'[^a-z0-9]+','','g')
+             and r.start_time <= coalesce(s.swapped_at, s.created_at)
+             and (ret.returned_at is null or ret.returned_at > coalesce(s.swapped_at, s.created_at))
+         )`,
+        [ids]
+      );
+
+      const { rowCount } = await client.query(
+        `delete from public.riders where id = any($1::uuid[])`,
+        [ids]
+      );
+
+      await client.query("commit");
+      res.json({ deleted: rowCount, swapsDeleted: swapsDeleted.rowCount || 0 });
+    } catch (error) {
+      await client.query("rollback");
+      throw error;
+    } finally {
+      client.release();
+    }
+  } catch (error) {
+    res.status(500).json({ error: String(error?.message || error) });
+  }
+});
+
+app.get("/api/rentals", async (_req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `select r.*,
+              rd.full_name as rider_full_name,
+              rd.mobile as rider_mobile,
+              coalesce(r.meta->>'expected_end_time','') as expected_end_time,
+              ret.returned_at
+       from public.rentals r
+       left join public.riders rd on rd.id = r.rider_id
+       left join lateral (
+         select max(returned_at) as returned_at
+         from public.returns
+         where rental_id = r.id
+       ) ret on true
+       order by r.created_at desc`
+    );
+    res.json(rows || []);
+  } catch (error) {
+    res.status(500).json({ error: String(error?.message || error) });
+  }
+});
+
+app.post("/api/rentals", async (req, res) => {
+  const body = req.body || {};
+  const riderId = String(body.rider_id || "");
+  const startTime = body.start_time;
+  if (!riderId) return res.status(400).json({ error: "rider_id required" });
+  if (!startTime) return res.status(400).json({ error: "start_time required" });
+
+  const rentalMeta = body.meta && typeof body.meta === "object" ? body.meta : {};
+  // end_time from UI is an expected end date/time; actual return time is set on /api/returns/submit.
+  if (body.end_time) {
+    rentalMeta.expected_end_time = body.end_time;
+  }
+
+  const documents = body.documents && typeof body.documents === "object" ? body.documents : {};
+  const preRidePhotos = Array.isArray(documents.preRidePhotos) ? documents.preRidePhotos : [];
+
+  if (preRidePhotos.length === 0) {
+    return res.status(400).json({ error: "preRidePhotos required (at least 1 pre-ride vehicle photo)" });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query("begin");
+
+    const activeRideCheck = await client.query(
+      `select r.start_time,
+              coalesce(r.meta->>'expected_end_time','') as expected_end_time
+       from public.rentals r
+       where r.rider_id = $1
+         and not exists (select 1 from public.returns ret where ret.rental_id = r.id)
+       order by r.start_time desc
+       limit 1`,
+      [riderId]
+    );
+    if (activeRideCheck.rows?.length) {
+      const active = activeRideCheck.rows[0];
+      const expectedEnd = String(active?.expected_end_time || "").trim();
+      const startMs = new Date(startTime).getTime();
+      const expectedMs = expectedEnd ? new Date(expectedEnd).getTime() : NaN;
+
+      if (!expectedEnd || !Number.isFinite(expectedMs) || !Number.isFinite(startMs) || startMs < expectedMs) {
+        await client.query("rollback");
+        return res.status(409).json({
+          error: expectedEnd
+            ? `Rider already has an active ride until ${expectedEnd}. Choose a start time after that.`
+            : "Rider already has an active ride. Choose a start time after the active ride ends.",
+        });
+      }
+    }
+
+    const availability = await getActiveAvailability({ client });
+    const requestedVehicleId = normalizeIdForCompare(body.bike_id || "");
+    const requestedVehicleNumber = normalizeIdForCompare(body.vehicle_number || "");
+    const requestedBatteryId = normalizeIdForCompare(body.battery_id || "");
+
+    if (requestedVehicleId && availability.unavailableVehicleIdSet.has(requestedVehicleId)) {
+      await client.query("rollback");
+      return res.status(409).json({ error: "Selected vehicle is unavailable (already in an active rental)." });
+    }
+    if (
+      requestedVehicleNumber &&
+      availability.unavailableVehicleNumberSet.has(requestedVehicleNumber)
+    ) {
+      await client.query("rollback");
+      return res.status(409).json({ error: "Selected vehicle is unavailable (already in an active rental)." });
+    }
+    if (
+      requestedBatteryId &&
+      !isSharedDefaultBatteryId(requestedBatteryId) &&
+      availability.unavailableBatteryIdSet.has(requestedBatteryId)
+    ) {
+      await client.query("rollback");
+      return res.status(409).json({ error: "Selected battery is unavailable (already in an active rental)." });
+    }
+
+    const { rows } = await client.query(
+      `insert into public.rentals
+         (rider_id, start_time, end_time, rental_package, rental_amount, deposit_amount, total_amount, payment_mode, bike_model, bike_id, battery_id, vehicle_number, accessories, other_accessories, meta)
+       values
+         ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+       returning *`,
+      [
+        riderId,
+        startTime,
+        null,
+        body.rental_package || null,
+        Number(body.rental_amount ?? 0),
+        Number(body.deposit_amount ?? 0),
+        Number(body.total_amount ?? 0),
+        body.payment_mode || null,
+        body.bike_model || null,
+        body.bike_id || null,
+        body.battery_id || null,
+        body.vehicle_number || null,
+        JSON.stringify(body.accessories || []),
+        body.other_accessories || null,
+        JSON.stringify(rentalMeta),
+      ]
+    );
+
+    const rentalRow = rows[0] || null;
+    const rentalId = rentalRow?.id;
+
+    if (rentalRow) {
+      await autoCreateBatterySwapForRental({ client, rental: rentalRow });
+    }
+
+    // Optional: store pre-ride photos for this rental (data URLs)
+    if (rentalId) {
+      for (const p of preRidePhotos) {
+        if (!p?.dataUrl) continue;
+        const saved = await saveDataUrlToUploads({
+          dataUrl: p.dataUrl,
+          fileNameHint: p.name || "pre-ride.jpg",
+        });
+
+        await client.query(
+          `insert into public.documents (rider_id, rental_id, kind, file_name, mime_type, size_bytes, url)
+           values ($1,$2,'pre_ride_photo',$3,$4,$5,$6)`,
+          [riderId, rentalId, saved.file_name, saved.mime_type, saved.size_bytes, saved.url]
+        );
+      }
+    }
+
+    await client.query("commit");
+    res.status(201).json(rentalRow);
+  } catch (error) {
+    await client.query("rollback");
+    res.status(500).json({ error: String(error?.message || error) });
+  } finally {
+    client.release();
+  }
+});
+
+// Update an active rental (used for retain rider when the rider hasn't returned yet)
+// Includes payment verification for ICICI payment gateway integration
+// Blocks rental update if payment is not verified as SUCCESS
+app.patch("/api/rentals/:id", async (req, res) => {
+  const rentalId = String(req.params.id || "").trim();
+  if (!rentalId) return res.status(400).json({ error: "id required" });
+
+  const body = req.body || {};
+  const client = await pool.connect();
+  try {
+    await client.query("begin");
+
+    const rentalQ = await client.query(
+      `select r.*,
+              exists(select 1 from public.returns rt where rt.rental_id = r.id) as has_return
+       from public.rentals r
+       where r.id = $1`,
+      [rentalId]
+    );
+    const rentalRow = rentalQ.rows?.[0] || null;
+    if (!rentalRow) {
+      await client.query("rollback");
+      return res.status(404).json({ error: "Rental not found" });
+    }
+    if (rentalRow.has_return) {
+      await client.query("rollback");
+      return res.status(409).json({ error: "Rental already ended (returned)." });
+    }
+
+    // Payment verification for retain rider flow
+    // Check if payment is required and verified before allowing rental update
+    const paymentMode = String(body.payment_mode || body.paymentMode || rentalRow.payment_mode || "").trim().toLowerCase();
+    const rentalMeta = rentalRow.meta && typeof rentalRow.meta === "object" ? rentalRow.meta : {};
+    const newRentalMeta = body.meta && typeof body.meta === "object" ? body.meta : {};
+    const merchantTranId = newRentalMeta.iciciMerchantTranId || newRentalMeta.merchantTranId || rentalMeta.iciciMerchantTranId || rentalMeta.merchantTranId || null;
+    const iciciEnabled = String(process.env.VITE_ICICI_ENABLED || "false")
+      .trim()
+      .replace(/^"+|"+$/g, "")
+      .toLowerCase() === "true";
+    const totalAmount = Number(body.total_amount ?? body.totalAmount ?? rentalRow.total_amount ?? 0);
+
+    if (iciciEnabled && paymentMode !== "cash" && merchantTranId && totalAmount > 0) {
+      try {
+        const { rows } = await pool.query(
+          `select status, amount, transaction_type
+           from public.payment_transactions
+           where merchant_tran_id = $1
+           limit 1`,
+          [merchantTranId]
+        );
+
+        if (!rows || rows.length === 0) {
+          await client.query("rollback");
+          return res.status(402).json({
+            error: "Payment transaction not found. Please complete payment before updating rental.",
+            paymentRequired: true,
+          });
+        }
+
+        const paymentTxn = rows[0];
+        if (paymentTxn.status !== "SUCCESS") {
+          await client.query("rollback");
+          return res.status(402).json({
+            error: `Payment not completed. Current status: ${paymentTxn.status}. Please complete payment before updating rental.`,
+            paymentRequired: true,
+            paymentStatus: paymentTxn.status,
+          });
+        }
+
+        const expectedTxnAmount = (() => {
+          if (paymentMode !== "split") return parseMoneyValue(totalAmount);
+          const online =
+            parseMoneyValue(newRentalMeta?.paymentBreakdown?.online) ??
+            parseMoneyValue(rentalMeta?.paymentBreakdown?.online);
+          return online ?? parseMoneyValue(totalAmount);
+        })();
+
+        const paid = parseMoneyValue(paymentTxn.amount);
+
+        // Verify payment amount matches expected ICICI-paid amount
+        if (expectedTxnAmount !== null && paid !== null && paid !== expectedTxnAmount) {
+          await client.query("rollback");
+          return res.status(402).json({
+            error: `Payment amount mismatch. Expected ₹${expectedTxnAmount}, but payment is ₹${paid}.`,
+            paymentRequired: true,
+          });
+        }
+      } catch (error) {
+        await client.query("rollback");
+        console.error("Payment verification error during rental update", String(error?.message || error));
+        return res.status(500).json({
+          error: "Payment verification failed. Please try again or contact support.",
+        });
+      }
+    }
+
+    const set = [];
+    const params = [];
+    const push = (v) => {
+      params.push(v);
+      return `$${params.length}`;
+    };
+
+    if (body.rental_package !== undefined) set.push(`rental_package = ${push(body.rental_package || null)}`);
+    if (body.rental_amount !== undefined) set.push(`rental_amount = ${push(Number(body.rental_amount ?? 0))}`);
+    if (body.deposit_amount !== undefined) set.push(`deposit_amount = ${push(Number(body.deposit_amount ?? 0))}`);
+    if (body.total_amount !== undefined) set.push(`total_amount = ${push(Number(body.total_amount ?? 0))}`);
+    if (body.payment_mode !== undefined) set.push(`payment_mode = ${push(body.payment_mode || null)}`);
+    if (body.bike_model !== undefined) set.push(`bike_model = ${push(body.bike_model || null)}`);
+
+    const metaPatch = { ...newRentalMeta };
+    if (body.expected_end_time !== undefined || body.end_time !== undefined) {
+      const expected = body.expected_end_time !== undefined ? body.expected_end_time : body.end_time;
+      metaPatch.expected_end_time = expected || null;
+    }
+
+    if (Object.keys(metaPatch).length > 0) {
+      set.push(`meta = coalesce(meta,'{}'::jsonb) || ${push(JSON.stringify(metaPatch))}::jsonb`);
+    }
+
+    if (set.length === 0) {
+      await client.query("commit");
+      return res.json({ ok: true });
+    }
+
+    params.push(rentalId);
+    const updated = await client.query(
+      `update public.rentals
+       set ${set.join(", ")}
+       where id = $${params.length}
+       returning *`,
+      params
+    );
+
+    await client.query("commit");
+    return res.json(updated.rows?.[0] || null);
+  } catch (error) {
+    await client.query("rollback");
+    return res.status(500).json({ error: String(error?.message || error) });
+  } finally {
+    client.release();
+  }
+});
+
+// ICICI Payment Gateway Integration - Diagnostic endpoint
+app.get("/api/payments/icici/status", async (req, res) => {
+  try {
+    const cryptoStatus = getIciciCryptoStatus();
+    res.json({
+      configured: Boolean(iciciBaseUrl && iciciQrEndpoint && iciciApiKey && iciciMid),
+      crypto: {
+        hasPublicKey: cryptoStatus.hasPublicKey,
+        hasPrivateKey: cryptoStatus.hasPrivateKey,
+      },
+      publicKeyPath: process.env.ICICI_PUBLIC_KEY_PATH || null,
+      privateKeyPath: process.env.ICICI_CLIENT_PRIVATE_KEY_P12_PATH || null,
+      baseUrl: iciciBaseUrl || null,
+      endpoint: iciciQrEndpoint || null,
+      mid: iciciMid || null,
+      hasApiKey: Boolean(iciciApiKey),
+    });
+  } catch (error) {
+    res.status(500).json({ error: String(error?.message || error) });
+  }
+});
+
+// ICICI Payment Gateway Integration
+app.post("/api/payments/icici/qr", async (req, res) => {
+  try {
+    const { amount, billNumber, merchantTranId, terminalId, validatePayerAccFlag, payerAccount, payerIFSC } =
+      req.body || {};
+
+    if (!amount) {
+      return res.status(400).json({ error: "amount is required" });
+    }
+
+    if (!iciciBaseUrl || !iciciQrEndpoint || !iciciApiKey || !iciciMid) {
+      return res.status(500).json({ error: "ICICI payment gateway not configured" });
+    }
+
+    const cryptoStatus = getIciciCryptoStatus();
+    if (!cryptoStatus.hasPublicKey) {
+      return res.status(500).json({
+        error:
+          "ICICI encryption not configured. Set ICICI_PUBLIC_KEY_PATH (ICICI .cer) or ICICI_PUBLIC_KEY_PEM on the server.",
+      });
+    }
+
+    if (!fetchApi) {
+      return res.status(500).json({
+        error: "Server fetch() not available. Use Node 18+ or provide a fetch polyfill.",
+      });
+    }
+
+    const mcc = String(terminalId || process.env.ICICI_TERMINAL_ID || "5411").trim();
+    const txnId =
+      String(merchantTranId || "").trim() ||
+      String(billNumber || "").trim() ||
+      crypto.randomUUID().replace(/-/g, "").slice(0, 32);
+
+    const payload = {
+      amount: Number(amount).toFixed(2),
+      merchantId: String(iciciMid),
+      terminalId: mcc,
+      merchantTranId: txnId,
+      billNumber: String(billNumber || txnId).slice(0, 50),
+    };
+
+    if (validatePayerAccFlag) {
+      payload.validatePayerAccFlag = String(validatePayerAccFlag).toUpperCase() === "Y" ? "Y" : "N";
+      if (payload.validatePayerAccFlag === "Y") {
+        if (payerAccount) payload.payerAccount = String(payerAccount);
+        if (payerIFSC) payload.payerIFSC = String(payerIFSC);
+      }
+    }
+
+    const mode = String(process.env.ICICI_ENCRYPTION_MODE || "asymmetric").toLowerCase();
+    const headers = {
+      // As per PDF: content-type is text/plain, API key header name is apikey
+      "Content-Type": "text/plain;charset=UTF-8",
+      Accept: "*/*",
+      apikey: iciciApiKey,
+    };
+
+    let outboundBody;
+    if (mode === "hybrid") {
+      const serviceName = String(process.env.ICICI_SERVICE_QR || "QR3").trim();
+      outboundBody = JSON.stringify(
+        buildIciciEncryptedRequest({ requestId: txnId, service: serviceName, payload })
+      );
+      headers["Content-Type"] = "application/json";
+      headers.Accept = "application/json";
+    } else {
+      outboundBody = encryptIciciAsymmetricPayload(payload);
+    }
+
+    const response = await fetchApi(`${iciciBaseUrl}${iciciQrEndpoint}`, {
+      method: "POST",
+      headers,
+      body: outboundBody,
+    });
+
+    const rawText = await response.text().catch(() => "");
+    let decoded = null;
+    if (mode === "hybrid") {
+      try {
+        decoded = rawText ? JSON.parse(rawText) : null;
+      } catch {
+        decoded = rawText;
+      }
+    } else {
+      try {
+        decoded = decodeIciciAsymmetricResponseOrThrow(rawText);
+      } catch (error) {
+        if (error?.code === "ICICI_PRIVATE_KEY_REQUIRED") {
+          return res.status(500).json({
+            error: String(error.message || error),
+            upstreamStatus: response.status,
+            upstreamBody: rawText,
+          });
+        }
+        throw error;
+      }
+    }
+
+    if (!response.ok) {
+      console.error("ICICI QR API failed", decoded);
+      const msg =
+        decoded && typeof decoded === "object"
+          ? decoded.message || decoded.error || decoded.response || "QR API failed"
+          : decoded || "QR API failed";
+      return res.status(response.status).json({
+        error: msg,
+        upstreamStatus: response.status,
+        upstreamBody: decoded,
+      });
+    }
+
+    const refId =
+      (decoded && (decoded.refId || decoded.refid || decoded.RefId || decoded.refID)) || null;
+    const respMerchantTranId =
+      (decoded && (decoded.merchantTranId || decoded.merchantTranID)) || txnId;
+
+    // PDF: upi://pay?pa=<merchant VPA>&pn=<merchant name>&tr=<Refid>&am=<amount>&cu=INR&mc=<MCC>
+    const payeeName = String(process.env.ICICI_PAYEE_NAME || "Evegah").trim();
+    const params = new URLSearchParams({
+      pa: String(iciciVpa || "").trim(),
+      pn: payeeName,
+      tr: String(refId || "").trim(),
+      am: Number(amount).toFixed(2),
+      cu: "INR",
+      mc: mcc,
+    });
+
+    // Store payment transaction record for tracking and verification
+    // This allows us to verify payment status before allowing rider actions
+    let paymentTransactionId = null;
+    if (databaseUrl && respMerchantTranId) {
+      try {
+        const transactionType = String(req.body?.transactionType || "NEW_RIDER").toUpperCase();
+        const rentalId = req.body?.rentalId || null;
+        const batterySwapId = req.body?.batterySwapId || null;
+        const riderId = req.body?.riderId || null;
+
+        const { rows: insertedRows } = await pool.query(
+          `insert into public.payment_transactions (
+             merchant_tran_id, ref_id, amount, status, transaction_type,
+             rental_id, battery_swap_id, rider_id, icici_response
+           ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+           returning id`,
+          [
+            respMerchantTranId,
+            refId || null,
+            Number(amount),
+            "PENDING",
+            transactionType,
+            rentalId,
+            batterySwapId,
+            riderId,
+            JSON.stringify(decoded || {}),
+          ]
+        );
+        paymentTransactionId = insertedRows?.[0]?.id || null;
+      } catch (error) {
+        console.warn("Failed to create payment transaction record", String(error?.message || error));
+      }
+    }
+
+    return res.json({
+      merchantId: String(iciciMid),
+      terminalId: mcc,
+      merchantTranId: respMerchantTranId,
+      refId,
+      qrString: `upi://pay?${params.toString()}`,
+      paymentTransactionId,
+      upstream: decoded,
+    });
+  } catch (error) {
+    console.error("ICICI QR generation error", error);
+    return res.status(500).json({ error: String(error?.message || error) });
+  }
+});
+
+// ICICI Transaction Status API Endpoint
+// Verifies payment status by querying ICICI Transaction Status API
+// Updates payment_transactions table with latest status from ICICI
+app.post("/api/payments/icici/status", async (req, res) => {
+  try {
+    const { merchantTranId, subMerchantId, terminalId } = req.body || {};
+
+    if (!merchantTranId) {
+      return res.status(400).json({ error: "merchantTranId is required" });
+    }
+
+    if (!iciciBaseUrl || !iciciTransactionStatusEndpoint || !iciciApiKey) {
+      return res.status(500).json({ error: "ICICI payment gateway not configured" });
+    }
+
+    if (!fetchApi) {
+      return res.status(500).json({
+        error: "Server fetch() not available. Use Node 18+ or provide a fetch polyfill.",
+      });
+    }
+
+    const mcc = String(terminalId || process.env.ICICI_TERMINAL_ID || "5411").trim();
+    const subMid = String(subMerchantId || process.env.ICICI_SUB_MERCHANT_ID || iciciMid).trim();
+
+    const payload = {
+      merchantId: String(iciciMid),
+      subMerchantId: subMid,
+      terminalId: mcc,
+      merchantTranId: String(merchantTranId),
+    };
+
+    const mode = String(process.env.ICICI_ENCRYPTION_MODE || "asymmetric").toLowerCase();
+    const headers = {
+      "Content-Type": "text/plain;charset=UTF-8",
+      Accept: "*/*",
+      apikey: iciciApiKey,
+    };
+
+    let outboundBody;
+    if (mode === "hybrid") {
+      const serviceName = String(process.env.ICICI_SERVICE_STATUS || "TransactionStatus3").trim();
+      outboundBody = JSON.stringify(
+        buildIciciEncryptedRequest({ requestId: crypto.randomUUID(), service: serviceName, payload })
+      );
+      headers["Content-Type"] = "application/json";
+      headers.Accept = "application/json";
+    } else {
+      outboundBody = encryptIciciAsymmetricPayload(payload);
+    }
+
+    const response = await fetchApi(`${iciciBaseUrl}${iciciTransactionStatusEndpoint}`, {
+      method: "POST",
+      headers,
+      body: outboundBody,
+    });
+
+    const rawText = await response.text().catch(() => "");
+    let decoded = null;
+    if (mode === "hybrid") {
+      try {
+        decoded = rawText ? JSON.parse(rawText) : null;
+      } catch {
+        decoded = rawText;
+      }
+    } else {
+      try {
+        decoded = decodeIciciAsymmetricResponseOrThrow(rawText);
+      } catch (error) {
+        if (error?.code === "ICICI_PRIVATE_KEY_REQUIRED") {
+          return res.status(500).json({
+            error: String(error.message || error),
+            upstreamStatus: response.status,
+            upstreamBody: rawText,
+          });
+        }
+        throw error;
+      }
+    }
+
+    if (!response.ok) {
+      console.error("ICICI status check failed", decoded);
+      const msg =
+        decoded && typeof decoded === "object"
+          ? decoded.message || decoded.error || decoded.response || "Status check failed"
+          : decoded || "Status check failed";
+      return res.status(response.status).json({
+        error: msg,
+        upstreamStatus: response.status,
+        upstreamBody: decoded,
+      });
+    }
+
+    // Update payment_transactions table with status from ICICI API
+    // ICICI response format: response, merchantId, subMerchantId, terminalId, success, message,
+    // merchantTranId, OriginalBankRRN, amount, status (PENDING/SUCCESS/FAILURE)
+    if (databaseUrl && decoded) {
+      try {
+        const iciciStatus = String(decoded.status || decoded.Status || "PENDING").toUpperCase();
+        const bankRRN = decoded.OriginalBankRRN || decoded.originalBankRRN || decoded.bankRRN || null;
+        const transactionAmount = decoded.amount || decoded.Amount || null;
+
+        // Map ICICI status to our payment_transactions status
+        let paymentStatus = "PENDING";
+        if (iciciStatus === "SUCCESS") {
+          paymentStatus = "SUCCESS";
+        } else if (iciciStatus === "FAILURE" || iciciStatus === "FAILED") {
+          paymentStatus = "FAILURE";
+        }
+
+        await pool.query(
+          `update public.payment_transactions
+           set status = $1,
+               bank_rrn = coalesce(nullif($2, ''), bank_rrn),
+               icici_response = $3,
+               last_status_check_at = now(),
+               verification_attempts = verification_attempts + 1,
+               verified_at = case when $1 = 'SUCCESS' and verified_at is null then now() else verified_at end,
+               updated_at = now()
+           where merchant_tran_id = $4`,
+          [
+            paymentStatus,
+            bankRRN,
+            JSON.stringify(decoded),
+            merchantTranId,
+          ]
+        );
+      } catch (error) {
+        console.warn("Failed to update payment transaction status", String(error?.message || error));
+      }
+    }
+
+    return res.json(decoded);
+  } catch (error) {
+    console.error("ICICI status check error", error);
+    return res.status(500).json({ error: String(error?.message || error) });
+  }
+});
+
+// Payment Verification Endpoint
+// Verifies if payment transaction exists and has SUCCESS status
+// Used by frontend to check payment status before allowing rider actions
+app.post("/api/payments/icici/verify", async (req, res) => {
+  try {
+    const { merchantTranId, rentalId, transactionType } = req.body || {};
+
+    if (!merchantTranId && !rentalId) {
+      return res.status(400).json({ error: "merchantTranId or rentalId is required" });
+    }
+
+    if (!databaseUrl) {
+      return res.status(500).json({ error: "Database not configured" });
+    }
+
+    let query;
+    let params;
+
+    if (merchantTranId) {
+      query = `select id, merchant_tran_id, ref_id, bank_rrn, amount, status, transaction_type,
+                      rental_id, battery_swap_id, rider_id, verified_at, created_at
+               from public.payment_transactions
+               where merchant_tran_id = $1
+               limit 1`;
+      params = [merchantTranId];
+    } else {
+      query = `select id, merchant_tran_id, ref_id, bank_rrn, amount, status, transaction_type,
+                      rental_id, battery_swap_id, rider_id, verified_at, created_at
+               from public.payment_transactions
+               where rental_id = $1`;
+      params = [rentalId];
+      if (transactionType) {
+        query += ` and transaction_type = $2`;
+        params.push(transactionType);
+      }
+      query += ` order by created_at desc limit 1`;
+    }
+
+    const { rows } = await pool.query(query, params);
+
+    if (!rows || rows.length === 0) {
+      return res.json({
+        verified: false,
+        exists: false,
+        message: "Payment transaction not found",
+      });
+    }
+
+    const transaction = rows[0];
+    const isVerified = transaction.status === "SUCCESS";
+
+    return res.json({
+      verified: isVerified,
+      exists: true,
+      transaction: {
+        id: transaction.id,
+        merchantTranId: transaction.merchant_tran_id,
+        refId: transaction.ref_id,
+        bankRRN: transaction.bank_rrn,
+        amount: transaction.amount,
+        status: transaction.status,
+        transactionType: transaction.transaction_type,
+        rentalId: transaction.rental_id,
+        batterySwapId: transaction.battery_swap_id,
+        riderId: transaction.rider_id,
+        verifiedAt: transaction.verified_at,
+        createdAt: transaction.created_at,
+      },
+      message: isVerified ? "Payment verified successfully" : `Payment status: ${transaction.status}`,
+    });
+  } catch (error) {
+    console.error("Payment verification error", error);
+    return res.status(500).json({ error: String(error?.message || error) });
+  }
+});
+
+app.post("/api/payments/icici/refund", async (req, res) => {
+  try {
+    const {
+      originalBankRRN,
+      merchantTranId,
+      originalmerchantTranId,
+      refundAmount,
+      note,
+      onlineRefund,
+      payeeVA,
+      subMerchantId,
+      terminalId,
+    } = req.body || {};
+
+    if (!originalBankRRN || !merchantTranId || !originalmerchantTranId || !refundAmount || !note) {
+      return res.status(400).json({
+        error:
+          "originalBankRRN, merchantTranId, originalmerchantTranId, refundAmount and note are required",
+      });
+    }
+
+    if (!iciciBaseUrl || !iciciRefundEndpoint || !iciciApiKey) {
+      return res.status(500).json({ error: "ICICI payment gateway not configured" });
+    }
+
+    if (!fetchApi) {
+      return res.status(500).json({
+        error: "Server fetch() not available. Use Node 18+ or provide a fetch polyfill.",
+      });
+    }
+
+    const mcc = String(terminalId || process.env.ICICI_TERMINAL_ID || "5411").trim();
+    const subMid = String(subMerchantId || process.env.ICICI_SUB_MERCHANT_ID || iciciMid).trim();
+
+    const payload = {
+      merchantId: String(iciciMid),
+      subMerchantId: subMid,
+      terminalId: mcc,
+      originalBankRRN: String(originalBankRRN),
+      merchantTranId: String(merchantTranId),
+      originalmerchantTranId: String(originalmerchantTranId),
+      refundAmount: Number(refundAmount).toFixed(2),
+      note: String(note).slice(0, 50),
+      onlineRefund: String(onlineRefund || "Y").toUpperCase() === "N" ? "N" : "Y",
+    };
+
+    if (payeeVA) payload.payeeVA = String(payeeVA);
+
+    const mode = String(process.env.ICICI_ENCRYPTION_MODE || "asymmetric").toLowerCase();
+    const headers = {
+      "Content-Type": "text/plain;charset=UTF-8",
+      Accept: "*/*",
+      apikey: iciciApiKey,
+    };
+
+    let outboundBody;
+    if (mode === "hybrid") {
+      const serviceName = String(process.env.ICICI_SERVICE_REFUND || "Refund").trim();
+      outboundBody = JSON.stringify(
+        buildIciciEncryptedRequest({ requestId: crypto.randomUUID(), service: serviceName, payload })
+      );
+      headers["Content-Type"] = "application/json";
+      headers.Accept = "application/json";
+    } else {
+      outboundBody = encryptIciciAsymmetricPayload(payload);
+    }
+
+    const response = await fetchApi(`${iciciBaseUrl}${iciciRefundEndpoint}`, {
+      method: "POST",
+      headers,
+      body: outboundBody,
+    });
+
+    const rawText = await response.text().catch(() => "");
+    let decoded = null;
+    if (mode === "hybrid") {
+      try {
+        decoded = rawText ? JSON.parse(rawText) : null;
+      } catch {
+        decoded = rawText;
+      }
+    } else {
+      try {
+        decoded = decodeIciciAsymmetricResponseOrThrow(rawText);
+      } catch (error) {
+        if (error?.code === "ICICI_PRIVATE_KEY_REQUIRED") {
+          return res.status(500).json({
+            error: String(error.message || error),
+            upstreamStatus: response.status,
+            upstreamBody: rawText,
+          });
+        }
+        throw error;
+      }
+    }
+
+    if (!response.ok) {
+      console.error("ICICI refund failed", decoded);
+      const msg =
+        decoded && typeof decoded === "object"
+          ? decoded.message || decoded.error || decoded.response || "Refund failed"
+          : decoded || "Refund failed";
+      return res.status(response.status).json({
+        error: msg,
+        upstreamStatus: response.status,
+        upstreamBody: decoded,
+      });
+    }
+
+    return res.json(decoded);
+  } catch (error) {
+    console.error("ICICI refund error", error);
+    return res.status(500).json({ error: String(error?.message || error) });
+  }
+});
+
+// ICICI Payment Gateway Callback Handler
+// Handles encrypted callback responses from ICICI Bank UPI API
+// Updates payment_transactions table and payment_notifications for reconciliation
+// Performs signature verification if configured for security
+app.post("/api/payments/icici/callback", async (req, res) => {
+  let payload = req.body || {};
+  const signatureSecret = String(process.env.ICICI_PAYMENT_SIGNATURE_SECRET || "").trim();
+  let rawBody = req.rawBody || (payload ? JSON.stringify(payload) : "");
+
+  // Handle encrypted callback payload - ICICI sends encrypted Base64 encoded response
+  // Decrypt using client private key if payload appears encrypted
+  const contentType = String(req.headers["content-type"] || "").toLowerCase();
+  if (contentType.includes("text/plain") && typeof rawBody === "string" && rawBody.trim()) {
+    try {
+      const decrypted = decodeIciciAsymmetricResponseOrThrow(rawBody);
+      if (decrypted && typeof decrypted === "object") {
+        payload = decrypted;
+        rawBody = JSON.stringify(decrypted);
+      }
+    } catch (error) {
+      console.warn("ICICI callback decryption attempt failed, treating as plain JSON", String(error?.message || error));
+    }
+  }
+
+  // Signature verification for callback security
+  const signatureHeader =
+    req.headers["x-icici-signature"] ||
+    req.headers["x-signature"] ||
+    req.headers.signature ||
+    "";
+  const normalizedSignature = String(signatureHeader || "").trim().toLowerCase();
+
+  if (signatureSecret) {
+    if (!normalizedSignature) {
+      return res.status(400).json({ error: "missing signature" });
+    }
+    const expected = crypto.createHmac("sha256", signatureSecret).update(rawBody).digest("hex");
+    if (expected.toLowerCase() !== normalizedSignature) {
+      console.warn("ICICI callback signature mismatch", {
+        expected,
+        provided: normalizedSignature,
+      });
+      return res.status(401).json({ error: "invalid signature" });
+    }
+  }
+
+  // Extract callback data using ICICI API documentation field names
+  // ICICI callback format: merchantId, subMerchantId, terminalId, BankRRN, merchantTranId,
+  // PayerName, PayerMobile, PayerVA, PayerAmount, TxnStatus, TxnInitDate, TxnCompletionDate
+  const findFirst = (...values) => {
+    for (const value of values) {
+      if (value === undefined || value === null) continue;
+      const trimmed = String(value).trim();
+      if (trimmed) return trimmed;
+    }
+    return "";
+  };
+
+  // Extract merchant transaction ID (primary identifier)
+  const merchantTranId = findFirst(
+    payload.merchantTranId,
+    payload.merchantTranID,
+    payload.merchant_tran_id,
+    payload.merchantRefNo,
+    payload.merchant_reference_no,
+    payload.merchantReference,
+    payload.referenceId,
+    payload.reference
+  );
+
+  // Extract Bank RRN (Reference Number from ICICI)
+  const bankRRN = findFirst(
+    payload.BankRRN,
+    payload.bankRRN,
+    payload.bank_rrn,
+    payload.rrn,
+    payload.transactionId,
+    payload.txnId,
+    payload.transaction_reference
+  );
+
+  // Extract transaction status (ICICI uses TxnStatus field)
+  const statusRaw = findFirst(
+    payload.TxnStatus,
+    payload.txnStatus,
+    payload.status,
+    payload.payment_status,
+    payload.transactionStatus,
+    payload.responseCode,
+    payload.result
+  );
+  const status = statusRaw ? statusRaw.toUpperCase() : null;
+
+  // Extract status message
+  const statusMessage = findFirst(
+    payload.statusMessage,
+    payload.status_msg,
+    payload.responseMessage,
+    payload.response_message,
+    payload.message,
+    payload.note,
+    payload.response_desc
+  );
+
+  // Parse amount (ICICI uses PayerAmount field)
+  const parseAmount = (value) => {
+    if (value === undefined || value === null) return null;
+    const cleaned = String(value).replace(/[^0-9.\-]+/g, "");
+    if (!cleaned) return null;
+    const parsed = Number(cleaned);
+    if (!Number.isFinite(parsed)) return null;
+    return Number(parsed.toFixed(2));
+  };
+
+  const amount = parseAmount(
+    payload.PayerAmount,
+    payload.payerAmount,
+    payload.amount,
+    payload.payment_amount,
+    payload.transaction_amount,
+    payload.txnAmount,
+    payload.amountPaid,
+    payload.value,
+    payload.amt
+  );
+
+  // Extract payer information
+  const payerName = findFirst(payload.PayerName, payload.payerName, payload.payer_name);
+  const payerMobile = findFirst(payload.PayerMobile, payload.payerMobile, payload.payer_mobile);
+  const payerVA = findFirst(payload.PayerVA, payload.payerVA, payload.payer_va);
+
+  // Transaction dates
+  const txnInitDate = findFirst(payload.TxnInitDate, payload.txnInitDate, payload.txn_init_date);
+  const txnCompletionDate = findFirst(
+    payload.TxnCompletionDate,
+    payload.txnCompletionDate,
+    payload.txn_completion_date
+  );
+
+  // Determine payment transaction status
+  const successStates = new Set(["SUCCESS", "SUCCESSFUL", "COMPLETED", "PAID", "APPROVED", "OK"]);
+  const failureStates = new Set(["FAILED", "FAIL", "DECLINED", "REJECTED", "ERROR"]);
+  const pendingStates = new Set(["PENDING", "IN_PROGRESS", "PROCESSING", "RECEIVED"]);
+
+  const paymentStatus =
+    status && successStates.has(status)
+      ? "SUCCESS"
+      : status && failureStates.has(status)
+        ? "FAILURE"
+        : status && pendingStates.has(status)
+          ? "PENDING"
+          : "PENDING";
+
+  // Lookup payment transaction by merchantTranId
+  let paymentTransactionId = null;
+  let rentalId = null;
+  let batterySwapId = null;
+  let riderId = null;
+  let transactionType = null;
+
+  if (merchantTranId) {
+    try {
+      const { rows: txnRows } = await pool.query(
+        `select id, rental_id, battery_swap_id, rider_id, transaction_type, status
+         from public.payment_transactions
+         where merchant_tran_id = $1
+         limit 1`,
+        [merchantTranId]
+      );
+      if (txnRows?.[0]) {
+        paymentTransactionId = txnRows[0].id;
+        rentalId = txnRows[0].rental_id;
+        batterySwapId = txnRows[0].battery_swap_id;
+        riderId = txnRows[0].rider_id;
+        transactionType = txnRows[0].transaction_type;
+      }
+    } catch (error) {
+      console.warn("Payment transaction lookup failed", String(error?.message || error));
+    }
+  }
+
+  // If transaction not found by merchantTranId, try to find by rental_id from reference
+  if (!paymentTransactionId && merchantTranId) {
+    const isUuid = (value) =>
+      typeof value === "string" &&
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+    if (isUuid(merchantTranId)) {
+      try {
+        const { rows: rentalRows } = await pool.query(
+          `select id, rider_id from public.rentals where id = $1 limit 1`,
+          [merchantTranId]
+        );
+        if (rentalRows?.[0]) {
+          rentalId = rentalRows[0].id;
+          riderId = rentalRows[0].rider_id;
+        }
+      } catch (error) {
+        console.warn("Rental lookup failed in callback", String(error?.message || error));
+      }
+    }
+  }
+
+  // Store callback notification for audit trail
+  const headerSnapshot = {
+    "x-icici-signature": req.headers["x-icici-signature"] || null,
+    "x-signature": req.headers["x-signature"] || null,
+    signature: req.headers.signature || null,
+    "user-agent": req.headers["user-agent"] || null,
+    "content-type": req.headers["content-type"] || null,
+  };
+
+  let notificationId = null;
+  try {
+    const { rows: insertedRows } = await pool.query(
+      `insert into public.payment_notifications (
+         reference, transaction_id, status, status_message,
+         amount, payment_method, signature,
+         headers, payload, raw_body,
+         rental_id, payment_due_id
+       ) values (
+         $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12
+       ) returning id`,
+      [
+        merchantTranId || null,
+        bankRRN || null,
+        status,
+        statusMessage || null,
+        amount,
+        payerVA || null,
+        normalizedSignature || null,
+        headerSnapshot,
+        payload,
+        rawBody || null,
+        rentalId,
+        null,
+      ]
+    );
+    notificationId = insertedRows?.[0]?.id || null;
+  } catch (error) {
+    console.error("Failed to store ICICI callback notification", String(error?.message || error));
+    return res.status(500).json({ error: "failed to persist callback" });
+  }
+
+  // Update payment_transactions table with callback data
+  if (paymentTransactionId) {
+    try {
+      await pool.query(
+        `update public.payment_transactions
+         set status = $1,
+             bank_rrn = coalesce(nullif($2, ''), bank_rrn),
+             callback_data = $3,
+             verified_at = case when $1 = 'SUCCESS' then now() else verified_at end,
+             updated_at = now()
+         where id = $4`,
+        [
+          paymentStatus,
+          bankRRN || null,
+          JSON.stringify({
+            payerName,
+            payerMobile,
+            payerVA,
+            txnInitDate,
+            txnCompletionDate,
+            statusMessage,
+            callbackReceivedAt: new Date().toISOString(),
+          }),
+          paymentTransactionId,
+        ]
+      );
+    } catch (error) {
+      console.error("Failed to update payment transaction from callback", String(error?.message || error));
+    }
+  } else if (merchantTranId && rentalId) {
+    // Create payment transaction record if it doesn't exist (edge case)
+    try {
+      const { rows: createdRows } = await pool.query(
+        `insert into public.payment_transactions (
+           merchant_tran_id, ref_id, bank_rrn, amount, status, transaction_type,
+           rental_id, rider_id, callback_data, verified_at
+         ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, case when $5 = 'SUCCESS' then now() else null end)
+         returning id`,
+        [
+          merchantTranId,
+          null,
+          bankRRN || null,
+          amount,
+          paymentStatus,
+          transactionType || "NEW_RIDER",
+          rentalId,
+          riderId,
+          JSON.stringify({
+            payerName,
+            payerMobile,
+            payerVA,
+            txnInitDate,
+            txnCompletionDate,
+            statusMessage,
+            callbackReceivedAt: new Date().toISOString(),
+          }),
+        ]
+      );
+      paymentTransactionId = createdRows?.[0]?.id || null;
+    } catch (error) {
+      console.warn("Failed to create payment transaction from callback", String(error?.message || error));
+    }
+  }
+
+  return res.json({
+    ok: true,
+    recorded: Boolean(notificationId),
+    payment_transaction_updated: Boolean(paymentTransactionId),
+    merchant_tran_id: merchantTranId,
+    bank_rrn: bankRRN,
+    status: paymentStatus,
+    status_message: statusMessage,
+    amount,
+    rental_id: rentalId,
+    battery_swap_id: batterySwapId,
+  });
+});
+
+app.get("/api/returns", async (_req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `select
+          ret.id as return_id,
+          ret.rental_id,
+          ret.returned_at,
+          ret.condition_notes,
+          ret.created_at as return_created_at,
+          ret.meta as return_meta,
+
+          r.rider_id,
+          r.vehicle_number,
+          r.bike_id,
+          r.battery_id,
+          r.start_time,
+          coalesce(r.meta->>'expected_end_time','') as expected_end_time,
+          r.rental_amount,
+          r.deposit_amount,
+          r.total_amount,
+          r.payment_mode,
+
+          rd.full_name as rider_full_name,
+          rd.mobile as rider_mobile,
+          coalesce(rd.meta->>'rider_code','') as rider_code,
+
+          (coalesce(ret.meta->>'deposit_returned','false'))::boolean as deposit_returned,
+          coalesce(nullif(ret.meta->>'deposit_returned_amount','')::numeric, 0) as deposit_returned_amount,
+          coalesce(ret.meta->>'deposit_returned_at','') as deposit_returned_at
+        from public.returns ret
+        left join public.rentals r on r.id = ret.rental_id
+        left join public.riders rd on rd.id = r.rider_id
+        order by ret.created_at desc`
+    );
+    res.json(rows || []);
+  } catch (error) {
+    res.status(500).json({ error: String(error?.message || error) });
+  }
+});
+
+app.get("/api/riders/:id/rentals", async (req, res) => {
+  const riderId = String(req.params.id || "");
+  if (!riderId) return res.status(400).json({ error: "id required" });
+  try {
+    const { rows } = await pool.query(
+      `select * from public.rentals where rider_id = $1 order by start_time desc`,
+      [riderId]
+    );
+    res.json(rows || []);
+  } catch (error) {
+    res.status(500).json({ error: String(error?.message || error) });
+  }
+});
+
+app.get("/api/riders/:id/documents", async (req, res) => {
+  const riderId = String(req.params.id || "");
+  if (!riderId) return res.status(400).json({ error: "id required" });
+  try {
+    const { rows } = await pool.query(
+      `select distinct d.*
+       from public.documents d
+       where d.rider_id = $1
+          or d.rental_id in (select id from public.rentals where rider_id = $1)
+          or d.return_id in (
+            select rt.id
+            from public.returns rt
+            join public.rentals r on r.id = rt.rental_id
+            where r.rider_id = $1
+          )
+       order by d.created_at desc`,
+      [riderId]
+    );
+    res.json(rows || []);
+  } catch (error) {
+    res.status(500).json({ error: String(error?.message || error) });
+  }
+});
+
+// Rider-centric battery swap history (matched via vehicle_number + swapped_at inside rental window)
+app.get("/api/riders/:id/battery-swaps", async (req, res) => {
+  const riderId = String(req.params.id || "");
+  if (!riderId) return res.status(400).json({ error: "id required" });
+
+  try {
+    const { rows } = await pool.query(
+      `select s.id, s.created_at, s.swapped_at, s.employee_uid, s.employee_email,
+              s.vehicle_number, s.battery_out, s.battery_in, s.notes,
+              rr.rental_id, rr.rider_id, rr.rider_full_name, rr.rider_mobile
+       from public.battery_swaps s
+       join lateral (
+         select r.id as rental_id,
+                rd.id as rider_id,
+                rd.full_name as rider_full_name,
+                rd.mobile as rider_mobile
+         from public.rentals r
+         left join public.riders rd on rd.id = r.rider_id
+         left join lateral (
+           select max(returned_at) as returned_at
+           from public.returns rt
+           where rt.rental_id = r.id
+         ) ret on true
+         where regexp_replace(lower(coalesce(r.vehicle_number,'')),'[^a-z0-9]+','','g') =
+               regexp_replace(lower(coalesce(s.vehicle_number,'')),'[^a-z0-9]+','','g')
+           and r.start_time <= coalesce(s.swapped_at, s.created_at)
+           and (ret.returned_at is null or ret.returned_at > coalesce(s.swapped_at, s.created_at))
+         order by r.start_time desc
+         limit 1
+       ) rr on true
+       where rr.rider_id = $1
+       order by coalesce(s.swapped_at, s.created_at) desc
+       `,
+      [riderId]
+    );
+
+    res.json(rows || []);
+  } catch (error) {
+    res.status(500).json({ error: String(error?.message || error) });
+  }
+});
+
+app.get("/api/rentals/:id/documents", async (req, res) => {
+  const rentalId = String(req.params.id || "");
+  if (!rentalId) return res.status(400).json({ error: "id required" });
+  try {
+    const { rows } = await pool.query(
+      `select distinct d.*
+       from public.documents d
+       where d.rental_id = $1
+          or d.return_id in (select id from public.returns where rental_id = $1)
+       order by d.created_at desc`,
+      [rentalId]
+    );
+    res.json(rows || []);
+  } catch (error) {
+    res.status(500).json({ error: String(error?.message || error) });
+  }
+});
+
+app.post("/api/riders/export-profiles", async (req, res) => {
+  let AdmZip;
+  try {
+    AdmZip = await getAdmZipCtor();
+  } catch {
+    return res.status(503).json({ error: "Profile export dependency not installed on server" });
+  }
+
+  try {
+    const sendProfilesZip = ({ zip, manifest }) => {
+      zip.addFile("export_manifest.json", Buffer.from(JSON.stringify(manifest, null, 2), "utf8"));
+      const outBuffer = zip.toBuffer();
+      const stamp = new Date().toISOString().slice(0, 10);
+      const outName = `rider-profiles-${stamp}.zip`;
+      res.setHeader("Content-Type", "application/zip");
+      res.setHeader("Content-Disposition", `attachment; filename="${outName}"`);
+      return res.send(outBuffer);
+    };
+
+    const inputIds = Array.isArray(req.body?.riderIds)
+      ? req.body.riderIds.map((id) => String(id || "").trim()).filter(isUuidLike)
+      : [];
+
+    if (Array.isArray(req.body?.riderIds) && inputIds.length === 0) {
+      return res.status(400).json({ error: "No valid riderIds provided" });
+    }
+
+    const riderIds = inputIds.length
+      ? inputIds
+      : (await pool.query(`select id from public.riders order by created_at desc`)).rows.map((r) => String(r.id));
+
+    if (riderIds.length === 0) {
+      return sendProfilesZip({
+        zip: new AdmZip(),
+        manifest: {
+          exported_at: new Date().toISOString(),
+          total_requested: 0,
+          riders: [],
+        },
+      });
+    }
+
+    const zip = new AdmZip();
+    const usedFolders = new Set();
+    const manifest = {
+      exported_at: new Date().toISOString(),
+      total_requested: riderIds.length,
+      riders: [],
+    };
+
+    for (let index = 0; index < riderIds.length; index += 1) {
+      const riderId = riderIds[index];
+      const bundle = await collectRiderProfileBundle(riderId);
+      if (!bundle?.rider) continue;
+
+      const riderMeta = toJsonObject(bundle.rider.meta, {});
+      const riderCode = String(riderMeta?.rider_code || "").trim();
+      const riderName = String(bundle.rider?.full_name || "").trim();
+      const riderMobile = String(bundle.rider?.mobile || "").trim();
+      const riderNameMobile = [riderName, riderMobile].filter(Boolean).join("-");
+      const folderBase = riderNameMobile || riderCode || bundle.rider.id;
+      let folderName = normalizeArchiveName(folderBase, `rider-${index + 1}`);
+      if (usedFolders.has(folderName)) {
+        let suffix = 2;
+        while (usedFolders.has(`${folderName}-${suffix}`)) suffix += 1;
+        folderName = `${folderName}-${suffix}`;
+      }
+      usedFolders.add(folderName);
+
+      const documentsForExport = [];
+      for (let docIndex = 0; docIndex < bundle.documents.length; docIndex += 1) {
+        const d = bundle.documents[docIndex];
+        const docCopy = { ...d };
+        const absPath = uploadsAbsPathFromUrl(d?.url);
+        if (absPath && fs.existsSync(absPath)) {
+          const ext = path.extname(String(d?.file_name || "")) || path.extname(absPath) || "";
+          const base = normalizeArchiveName(
+            path.basename(String(d?.file_name || ""), ext) || `document-${docIndex + 1}`,
+            `document-${docIndex + 1}`
+          );
+          const fileName = `${base}${ext || ".bin"}`;
+          const archivePath = `${folderName}/files/${fileName}`;
+          const fileBuffer = await fs.promises.readFile(absPath);
+          zip.addFile(archivePath, fileBuffer);
+          docCopy.archive_path = archivePath;
+        }
+        documentsForExport.push(docCopy);
+      }
+
+      zip.addFile(`${folderName}/rider.json`, Buffer.from(JSON.stringify(bundle.rider, null, 2), "utf8"));
+      zip.addFile(`${folderName}/rentals.json`, Buffer.from(JSON.stringify(bundle.rentals, null, 2), "utf8"));
+      zip.addFile(`${folderName}/returns.json`, Buffer.from(JSON.stringify(bundle.returns, null, 2), "utf8"));
+      zip.addFile(`${folderName}/documents.json`, Buffer.from(JSON.stringify(documentsForExport, null, 2), "utf8"));
+      zip.addFile(`${folderName}/battery-swaps.json`, Buffer.from(JSON.stringify(bundle.battery_swaps, null, 2), "utf8"));
+
+      manifest.riders.push({
+        rider_id: bundle.rider.id,
+        folder: folderName,
+        rentals: bundle.rentals.length,
+        returns: bundle.returns.length,
+        documents: documentsForExport.length,
+        battery_swaps: bundle.battery_swaps.length,
+      });
+    }
+
+    if (manifest.riders.length === 0) {
+      return sendProfilesZip({ zip, manifest });
+    }
+
+    return sendProfilesZip({ zip, manifest });
+  } catch (error) {
+    return res.status(500).json({ error: String(error?.message || error) });
+  }
+});
+
+app.post("/api/riders/import-profiles", profileArchiveUpload.single("archive"), async (req, res) => {
+  let AdmZip;
+  try {
+    AdmZip = await getAdmZipCtor();
+  } catch {
+    return res.status(503).json({ error: "Profile import dependency not installed on server" });
+  }
+
+  const file = req.file;
+  if (!file) return res.status(400).json({ error: "archive file is required" });
+
+  let zip;
+  try {
+    zip = new AdmZip(file.buffer);
+  } catch {
+    return res.status(400).json({ error: "Invalid zip archive" });
+  }
+
+  const entries = zip.getEntries().filter((e) => !e.isDirectory);
+  const riderEntries = entries.filter((e) => /(^|\/)rider\.json$/i.test(String(e.entryName || "")));
+  if (riderEntries.length === 0) {
+    return res.status(400).json({ error: "Archive does not contain rider profiles" });
+  }
+
+  const readJsonEntry = (entryPath, fallback) => {
+    const entry = zip.getEntry(entryPath);
+    if (!entry) return fallback;
+    try {
+      const parsed = JSON.parse(entry.getData().toString("utf8"));
+      return parsed ?? fallback;
+    } catch {
+      return fallback;
+    }
+  };
+
+  const packages = riderEntries.map((entry) => {
+    const folder = path.posix.dirname(String(entry.entryName || ""));
+    const root = folder === "." ? "" : folder;
+    const rider = readJsonEntry(entry.entryName, null);
+    const rentals = readJsonEntry(root ? `${root}/rentals.json` : "rentals.json", []);
+    const returns = readJsonEntry(root ? `${root}/returns.json` : "returns.json", []);
+    const documents = readJsonEntry(root ? `${root}/documents.json` : "documents.json", []);
+    const batterySwaps = readJsonEntry(root ? `${root}/battery-swaps.json` : "battery-swaps.json", []);
+    return {
+      folder: root,
+      rider: rider && typeof rider === "object" ? rider : null,
+      rentals: Array.isArray(rentals) ? rentals : [],
+      returns: Array.isArray(returns) ? returns : [],
+      documents: Array.isArray(documents) ? documents : [],
+      batterySwaps: Array.isArray(batterySwaps) ? batterySwaps : [],
+    };
+  });
+
+  const client = await pool.connect();
+  const summary = {
+    ridersImported: 0,
+    rentalsImported: 0,
+    returnsImported: 0,
+    documentsImported: 0,
+    batterySwapsImported: 0,
+    failedRiders: [],
+  };
+
+  try {
+    await client.query("begin");
+
+    for (const item of packages) {
+      await client.query("savepoint rider_profile_import");
+      try {
+        const riderRow = item.rider;
+        const fullName = String(riderRow?.full_name || "").trim();
+        const mobile = toDigits(riderRow?.mobile || "", 10);
+        if (!fullName || mobile.length !== 10) {
+          throw new Error("Invalid rider payload (full_name/mobile)");
+        }
+
+        const incomingRiderId = isUuidLike(riderRow?.id) ? String(riderRow.id) : null;
+        const riderMeta = toJsonObject(riderRow?.meta, {});
+        const aadhaar = toDigits(riderRow?.aadhaar || "", 12) || null;
+
+        const existingQ = await client.query(
+          `select id
+           from public.riders
+           where ($1::uuid is not null and id = $1::uuid)
+              or mobile = $2
+           limit 1`,
+          [incomingRiderId, mobile]
+        );
+        let riderId = existingQ.rows?.[0]?.id || null;
+
+        if (riderId) {
+          const updatedQ = await client.query(
+            `update public.riders
+             set full_name = $1,
+                 mobile = $2,
+                 aadhaar = $3,
+                 dob = $4,
+                 gender = $5,
+                 permanent_address = $6,
+                 temporary_address = $7,
+                 reference = $8,
+                 status = $9,
+                 meta = $10,
+                 updated_at = coalesce($11::timestamptz, now())
+             where id = $12
+             returning id`,
+            [
+              fullName,
+              mobile,
+              aadhaar,
+              riderRow?.dob || null,
+              riderRow?.gender || null,
+              riderRow?.permanent_address || null,
+              riderRow?.temporary_address || null,
+              riderRow?.reference || null,
+              riderRow?.status || "active",
+              JSON.stringify(riderMeta),
+              riderRow?.updated_at || null,
+              riderId,
+            ]
+          );
+          riderId = updatedQ.rows?.[0]?.id || riderId;
+        } else {
+          const insertWithId = Boolean(incomingRiderId);
+          const insertSql = insertWithId
+            ? `insert into public.riders
+                 (id, created_at, updated_at, full_name, mobile, aadhaar, dob, gender, permanent_address, temporary_address, reference, status, meta)
+               values
+                 ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+               returning id`
+            : `insert into public.riders
+                 (created_at, updated_at, full_name, mobile, aadhaar, dob, gender, permanent_address, temporary_address, reference, status, meta)
+               values
+                 ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+               returning id`;
+
+          const params = insertWithId
+            ? [
+              incomingRiderId,
+              riderRow?.created_at || new Date().toISOString(),
+              riderRow?.updated_at || riderRow?.created_at || new Date().toISOString(),
+              fullName,
+              mobile,
+              aadhaar,
+              riderRow?.dob || null,
+              riderRow?.gender || null,
+              riderRow?.permanent_address || null,
+              riderRow?.temporary_address || null,
+              riderRow?.reference || null,
+              riderRow?.status || "active",
+              JSON.stringify(riderMeta),
+            ]
+            : [
+              riderRow?.created_at || new Date().toISOString(),
+              riderRow?.updated_at || riderRow?.created_at || new Date().toISOString(),
+              fullName,
+              mobile,
+              aadhaar,
+              riderRow?.dob || null,
+              riderRow?.gender || null,
+              riderRow?.permanent_address || null,
+              riderRow?.temporary_address || null,
+              riderRow?.reference || null,
+              riderRow?.status || "active",
+              JSON.stringify(riderMeta),
+            ];
+
+          const insertedQ = await client.query(insertSql, params);
+          riderId = insertedQ.rows?.[0]?.id || null;
+        }
+
+        if (!riderId) {
+          throw new Error("Unable to create/update rider");
+        }
+
+        summary.ridersImported += 1;
+
+        const rentalIdMap = new Map();
+        const returnIdMap = new Map();
+        const incomingRiderIdKey = String(riderRow?.id || "");
+
+        for (const rentalRow of item.rentals) {
+          if (!rentalRow || typeof rentalRow !== "object") continue;
+          const incomingRentalId = isUuidLike(rentalRow?.id) ? String(rentalRow.id) : null;
+          const accessories = toJsonArray(rentalRow?.accessories);
+          const rentalMeta = toJsonObject(rentalRow?.meta, {});
+
+          const upsertWithId = Boolean(incomingRentalId);
+          const rentalSql = upsertWithId
+            ? `insert into public.rentals
+                 (id, created_at, updated_at, rider_id, start_time, end_time, rental_package, rental_amount, deposit_amount, total_amount, payment_mode, bike_model, bike_id, battery_id, vehicle_number, accessories, other_accessories, meta)
+               values
+                 ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+               on conflict (id) do update set
+                 rider_id = excluded.rider_id,
+                 start_time = excluded.start_time,
+                 end_time = excluded.end_time,
+                 rental_package = excluded.rental_package,
+                 rental_amount = excluded.rental_amount,
+                 deposit_amount = excluded.deposit_amount,
+                 total_amount = excluded.total_amount,
+                 payment_mode = excluded.payment_mode,
+                 bike_model = excluded.bike_model,
+                 bike_id = excluded.bike_id,
+                 battery_id = excluded.battery_id,
+                 vehicle_number = excluded.vehicle_number,
+                 accessories = excluded.accessories,
+                 other_accessories = excluded.other_accessories,
+                 meta = excluded.meta,
+                 updated_at = excluded.updated_at
+               returning id`
+            : `insert into public.rentals
+                 (created_at, updated_at, rider_id, start_time, end_time, rental_package, rental_amount, deposit_amount, total_amount, payment_mode, bike_model, bike_id, battery_id, vehicle_number, accessories, other_accessories, meta)
+               values
+                 ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+               returning id`;
+
+          const rentalParams = upsertWithId
+            ? [
+              incomingRentalId,
+              rentalRow?.created_at || new Date().toISOString(),
+              rentalRow?.updated_at || rentalRow?.created_at || new Date().toISOString(),
+              riderId,
+              rentalRow?.start_time,
+              rentalRow?.end_time || null,
+              rentalRow?.rental_package || null,
+              Number(rentalRow?.rental_amount ?? 0),
+              Number(rentalRow?.deposit_amount ?? 0),
+              Number(rentalRow?.total_amount ?? 0),
+              rentalRow?.payment_mode || null,
+              rentalRow?.bike_model || null,
+              rentalRow?.bike_id || null,
+              rentalRow?.battery_id || null,
+              rentalRow?.vehicle_number || null,
+              JSON.stringify(accessories),
+              rentalRow?.other_accessories || null,
+              JSON.stringify(rentalMeta),
+            ]
+            : [
+              rentalRow?.created_at || new Date().toISOString(),
+              rentalRow?.updated_at || rentalRow?.created_at || new Date().toISOString(),
+              riderId,
+              rentalRow?.start_time,
+              rentalRow?.end_time || null,
+              rentalRow?.rental_package || null,
+              Number(rentalRow?.rental_amount ?? 0),
+              Number(rentalRow?.deposit_amount ?? 0),
+              Number(rentalRow?.total_amount ?? 0),
+              rentalRow?.payment_mode || null,
+              rentalRow?.bike_model || null,
+              rentalRow?.bike_id || null,
+              rentalRow?.battery_id || null,
+              rentalRow?.vehicle_number || null,
+              JSON.stringify(accessories),
+              rentalRow?.other_accessories || null,
+              JSON.stringify(rentalMeta),
+            ];
+
+          const rentalQ = await client.query(rentalSql, rentalParams);
+          const savedRentalId = rentalQ.rows?.[0]?.id || null;
+          if (savedRentalId && incomingRentalId) {
+            rentalIdMap.set(incomingRentalId, savedRentalId);
+          }
+          summary.rentalsImported += savedRentalId ? 1 : 0;
+        }
+
+        for (const returnRow of item.returns) {
+          if (!returnRow || typeof returnRow !== "object") continue;
+          const incomingReturnId = isUuidLike(returnRow?.id) ? String(returnRow.id) : null;
+          const oldRentalId = String(returnRow?.rental_id || "");
+          const mappedRentalId = rentalIdMap.get(oldRentalId) || (isUuidLike(oldRentalId) ? oldRentalId : null);
+          if (!mappedRentalId) continue;
+
+          const returnMeta = toJsonObject(returnRow?.meta, {});
+          const upsertWithId = Boolean(incomingReturnId);
+          const returnSql = upsertWithId
+            ? `insert into public.returns
+                 (id, created_at, rental_id, returned_at, condition_notes, meta)
+               values
+                 ($1,$2,$3,$4,$5,$6)
+               on conflict (id) do update set
+                 rental_id = excluded.rental_id,
+                 returned_at = excluded.returned_at,
+                 condition_notes = excluded.condition_notes,
+                 meta = excluded.meta
+               returning id`
+            : `insert into public.returns
+                 (created_at, rental_id, returned_at, condition_notes, meta)
+               values
+                 ($1,$2,$3,$4,$5)
+               returning id`;
+
+          const returnParams = upsertWithId
+            ? [
+              incomingReturnId,
+              returnRow?.created_at || returnRow?.returned_at || new Date().toISOString(),
+              mappedRentalId,
+              returnRow?.returned_at || returnRow?.created_at || new Date().toISOString(),
+              returnRow?.condition_notes || null,
+              JSON.stringify(returnMeta),
+            ]
+            : [
+              returnRow?.created_at || returnRow?.returned_at || new Date().toISOString(),
+              mappedRentalId,
+              returnRow?.returned_at || returnRow?.created_at || new Date().toISOString(),
+              returnRow?.condition_notes || null,
+              JSON.stringify(returnMeta),
+            ];
+
+          const returnQ = await client.query(returnSql, returnParams);
+          const savedReturnId = returnQ.rows?.[0]?.id || null;
+          if (savedReturnId && incomingReturnId) {
+            returnIdMap.set(incomingReturnId, savedReturnId);
+          }
+          summary.returnsImported += savedReturnId ? 1 : 0;
+        }
+
+        for (const docRow of item.documents) {
+          if (!docRow || typeof docRow !== "object") continue;
+
+          const incomingDocId = isUuidLike(docRow?.id) ? String(docRow.id) : null;
+          const oldDocRiderId = String(docRow?.rider_id || "");
+          const oldDocRentalId = String(docRow?.rental_id || "");
+          const oldDocReturnId = String(docRow?.return_id || "");
+
+          const mappedDocRiderId = oldDocRiderId && oldDocRiderId === incomingRiderIdKey ? riderId : riderId;
+          const mappedDocRentalId = rentalIdMap.get(oldDocRentalId) || (isUuidLike(oldDocRentalId) ? oldDocRentalId : null);
+          const mappedDocReturnId = returnIdMap.get(oldDocReturnId) || (isUuidLike(oldDocReturnId) ? oldDocReturnId : null);
+
+          let nextUrl = String(docRow?.url || "").trim();
+          let nextFileName = String(docRow?.file_name || "").trim() || null;
+          let nextMime = String(docRow?.mime_type || "").trim() || null;
+          let nextSize = Number(docRow?.size_bytes || 0) || null;
+
+          const archivePath = String(docRow?.archive_path || "").trim();
+          if (archivePath) {
+            const archiveEntry = zip.getEntry(archivePath.replace(/^\/+/, ""));
+            if (archiveEntry) {
+              const raw = archiveEntry.getData();
+              const ext = path.extname(nextFileName || archivePath) || "";
+              const importedName = `${Date.now()}-${Math.random().toString(16).slice(2)}${ext || ".bin"}`;
+              const importedAbs = path.join(uploadsDir, importedName);
+              await fs.promises.writeFile(importedAbs, raw);
+              nextUrl = `/uploads/${importedName}`;
+              nextFileName = importedName;
+              nextSize = raw.length;
+              nextMime = nextMime || inferMimeTypeFromExt(ext);
+            }
+          }
+
+          if (!nextUrl) continue;
+
+          const docMeta = toJsonObject(docRow?.meta, {});
+          const upsertWithId = Boolean(incomingDocId);
+          const docSql = upsertWithId
+            ? `insert into public.documents
+                 (id, created_at, rider_id, rental_id, return_id, kind, file_name, mime_type, size_bytes, url, meta)
+               values
+                 ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+               on conflict (id) do update set
+                 rider_id = excluded.rider_id,
+                 rental_id = excluded.rental_id,
+                 return_id = excluded.return_id,
+                 kind = excluded.kind,
+                 file_name = excluded.file_name,
+                 mime_type = excluded.mime_type,
+                 size_bytes = excluded.size_bytes,
+                 url = excluded.url,
+                 meta = excluded.meta
+               returning id`
+            : `insert into public.documents
+                 (created_at, rider_id, rental_id, return_id, kind, file_name, mime_type, size_bytes, url, meta)
+               values
+                 ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+               returning id`;
+
+          const docParams = upsertWithId
+            ? [
+              incomingDocId,
+              docRow?.created_at || new Date().toISOString(),
+              mappedDocRiderId,
+              mappedDocRentalId,
+              mappedDocReturnId,
+              String(docRow?.kind || "").trim() || "document",
+              nextFileName,
+              nextMime,
+              nextSize,
+              nextUrl,
+              JSON.stringify(docMeta),
+            ]
+            : [
+              docRow?.created_at || new Date().toISOString(),
+              mappedDocRiderId,
+              mappedDocRentalId,
+              mappedDocReturnId,
+              String(docRow?.kind || "").trim() || "document",
+              nextFileName,
+              nextMime,
+              nextSize,
+              nextUrl,
+              JSON.stringify(docMeta),
+            ];
+
+          const docQ = await client.query(docSql, docParams);
+          summary.documentsImported += docQ.rows?.[0]?.id ? 1 : 0;
+        }
+
+        for (const swapRow of item.batterySwaps) {
+          if (!swapRow || typeof swapRow !== "object") continue;
+          const incomingSwapId = isUuidLike(swapRow?.id) ? String(swapRow.id) : null;
+          const vehicleNumber = String(swapRow?.vehicle_number || "").trim();
+          const batteryOut = String(swapRow?.battery_out || "").trim();
+          const batteryIn = String(swapRow?.battery_in || "").trim();
+          if (!vehicleNumber || !batteryOut || !batteryIn) continue;
+
+          const swapSql = incomingSwapId
+            ? `insert into public.battery_swaps
+                 (id, created_at, employee_uid, employee_email, vehicle_number, battery_out, battery_in, swapped_at, notes)
+               values
+                 ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+               on conflict (id) do update set
+                 employee_uid = excluded.employee_uid,
+                 employee_email = excluded.employee_email,
+                 vehicle_number = excluded.vehicle_number,
+                 battery_out = excluded.battery_out,
+                 battery_in = excluded.battery_in,
+                 swapped_at = excluded.swapped_at,
+                 notes = excluded.notes
+               returning id`
+            : `insert into public.battery_swaps
+                 (created_at, employee_uid, employee_email, vehicle_number, battery_out, battery_in, swapped_at, notes)
+               values
+                 ($1,$2,$3,$4,$5,$6,$7,$8)
+               returning id`;
+
+          const swapParams = incomingSwapId
+            ? [
+              incomingSwapId,
+              swapRow?.created_at || swapRow?.swapped_at || new Date().toISOString(),
+              String(swapRow?.employee_uid || "system").trim() || "system",
+              swapRow?.employee_email || null,
+              vehicleNumber,
+              batteryOut,
+              batteryIn,
+              swapRow?.swapped_at || swapRow?.created_at || new Date().toISOString(),
+              swapRow?.notes || null,
+            ]
+            : [
+              swapRow?.created_at || swapRow?.swapped_at || new Date().toISOString(),
+              String(swapRow?.employee_uid || "system").trim() || "system",
+              swapRow?.employee_email || null,
+              vehicleNumber,
+              batteryOut,
+              batteryIn,
+              swapRow?.swapped_at || swapRow?.created_at || new Date().toISOString(),
+              swapRow?.notes || null,
+            ];
+
+          const swapQ = await client.query(swapSql, swapParams);
+          summary.batterySwapsImported += swapQ.rows?.[0]?.id ? 1 : 0;
+        }
+      } catch (error) {
+        await client.query("rollback to savepoint rider_profile_import");
+        summary.failedRiders.push({
+          folder: item.folder || "root",
+          rider_id: item.rider?.id || null,
+          error: String(error?.message || error),
+        });
+      }
+    }
+
+    await client.query("commit");
+    return res.json({
+      ok: true,
+      ...summary,
+    });
+  } catch (error) {
+    await client.query("rollback");
+    return res.status(500).json({ error: String(error?.message || error) });
+  } finally {
+    client.release();
+  }
+});
+
+// New Rider registration: creates/updates rider + rental + stores images (data URLs)
+// Includes payment verification for ICICI payment gateway integration
+// Blocks registration if payment is not verified as SUCCESS
+app.post("/api/registrations/new-rider", async (req, res) => {
+  const body = req.body || {};
+
+  const rider = body.rider || {};
+  const rental = body.rental || {};
+  const documents = body.documents || {};
+
+  const rentalMeta = rental.meta && typeof rental.meta === "object" ? rental.meta : {};
+  // In this app, end_time coming from the form is an *expected* end date/time.
+  // The DB column end_time is reserved for the *actual* return time (set on /api/returns/submit).
+  if (rental.end_time) {
+    rentalMeta.expected_end_time = rental.end_time;
+  }
+
+  const fullName = String(rider.full_name || rider.name || "").trim();
+  const mobile = toDigits(rider.mobile || rider.phone || "", 10);
+  const aadhaar = toDigits(rider.aadhaar || "", 12);
+  const riderMeta = rider.meta && typeof rider.meta === "object" ? rider.meta : {};
+
+  if (!fullName) return res.status(400).json({ error: "full_name required" });
+  if (mobile.length !== 10) return res.status(400).json({ error: "valid mobile required" });
+  if (!rental.start_time) return res.status(400).json({ error: "start_time required" });
+
+  // Payment verification for ICICI payment gateway
+  // Check if payment transaction exists and has SUCCESS status
+  // Only allow registration if payment is verified or payment mode is cash
+  const paymentMode = String(rental.payment_mode || rental.paymentMode || "").trim().toLowerCase();
+  const merchantTranId = rentalMeta.iciciMerchantTranId || rentalMeta.merchantTranId || null;
+  const iciciEnabled = String(process.env.VITE_ICICI_ENABLED || "false")
+    .trim()
+    .replace(/^"+|"+$/g, "")
+    .toLowerCase() === "true";
+
+  if (iciciEnabled && paymentMode !== "cash" && merchantTranId) {
+    try {
+      // Check payment transaction status in database (preferred).
+      // If the DB/table isn't available, fall back to ICICI status API.
+      let rows = [];
+      try {
+        const q = await pool.query(
+          `select status, amount, transaction_type
+           from public.payment_transactions
+           where merchant_tran_id = $1
+           limit 1`,
+          [merchantTranId]
+        );
+        rows = q?.rows || [];
+      } catch (dbError) {
+        console.warn(
+          "Payment DB lookup failed; falling back to ICICI status API",
+          String(dbError?.message || dbError)
+        );
+        rows = [];
+      }
+
+      let paymentStatus = null;
+      let paymentAmount = null;
+
+      if (rows && rows.length > 0) {
+        paymentStatus = rows[0].status;
+        paymentAmount = rows[0].amount;
+      } else {
+        // Payment transaction not found in database - verify via ICICI API
+        if (!iciciBaseUrl || !iciciTransactionStatusEndpoint || !iciciApiKey || !fetchApi) {
+          return res.status(402).json({
+            error: "Payment verification service unavailable. Please complete payment before registration.",
+            paymentRequired: true,
+          });
+        }
+
+        const mcc = String(process.env.ICICI_TERMINAL_ID || "5411").trim();
+        const subMid = String(process.env.ICICI_SUB_MERCHANT_ID || iciciMid).trim();
+        const statusPayload = {
+          merchantId: String(iciciMid),
+          subMerchantId: subMid,
+          terminalId: mcc,
+          merchantTranId: String(merchantTranId),
+        };
+
+        const mode = String(process.env.ICICI_ENCRYPTION_MODE || "asymmetric").toLowerCase();
+        const headers = {
+          "Content-Type": "text/plain;charset=UTF-8",
+          Accept: "*/*",
+          apikey: iciciApiKey,
+        };
+
+        let outboundBody;
+        if (mode === "hybrid") {
+          const serviceName = String(process.env.ICICI_SERVICE_STATUS || "TransactionStatus3").trim();
+          outboundBody = JSON.stringify(
+            buildIciciEncryptedRequest({ requestId: crypto.randomUUID(), service: serviceName, payload: statusPayload })
+          );
+          headers["Content-Type"] = "application/json";
+          headers.Accept = "application/json";
+        } else {
+          outboundBody = encryptIciciAsymmetricPayload(statusPayload);
+        }
+
+        const statusResponse = await fetchApi(`${iciciBaseUrl}${iciciTransactionStatusEndpoint}`, {
+          method: "POST",
+          headers,
+          body: outboundBody,
+        });
+
+        const rawText = await statusResponse.text().catch(() => "");
+        let decoded = null;
+        if (mode === "hybrid") {
+          try {
+            decoded = rawText ? JSON.parse(rawText) : null;
+          } catch {
+            decoded = rawText;
+          }
+        } else {
+          try {
+            decoded = decodeIciciAsymmetricResponseOrThrow(rawText);
+          } catch (verifyError) {
+            console.warn("ICICI status API decryption failed", String(verifyError?.message || verifyError));
+            return res.status(402).json({
+              error: "Payment verification failed. Please complete payment before registration.",
+              paymentRequired: true,
+            });
+          }
+        }
+
+        if (!statusResponse.ok || !decoded) {
+          return res.status(402).json({
+            error: "Payment verification failed. Please complete payment before registration.",
+            paymentRequired: true,
+          });
+        }
+
+        const iciciStatus = String(decoded.status || decoded.Status || "PENDING").toUpperCase();
+        paymentStatus = iciciStatus === "SUCCESS" ? "SUCCESS" : iciciStatus === "FAILURE" ? "FAILURE" : "PENDING";
+        paymentAmount = decoded.amount || decoded.Amount || null;
+      }
+
+      // Verify payment status is SUCCESS
+      if (paymentStatus !== "SUCCESS") {
+        return res.status(402).json({
+          error: `Payment not completed. Current status: ${paymentStatus}. Please complete payment before registration.`,
+          paymentRequired: true,
+          paymentStatus: paymentStatus,
+        });
+      }
+
+      // Verify payment amount matches expected ICICI-paid amount
+      const rentalAmount = parseMoneyValue(rental.total_amount ?? rental.totalAmount ?? 0) ?? 0;
+      const expectedTxnAmount = (() => {
+        if (paymentMode !== "split") return rentalAmount;
+        const online = parseMoneyValue(rentalMeta?.paymentBreakdown?.online);
+        return online ?? rentalAmount;
+      })();
+
+      const paid = parseMoneyValue(paymentAmount);
+      if (paid !== null && expectedTxnAmount !== null && paid !== expectedTxnAmount) {
+        return res.status(402).json({
+          error: `Payment amount mismatch. Expected ₹${expectedTxnAmount}, but payment is ₹${paid}.`,
+          paymentRequired: true,
+        });
+      }
+    } catch (error) {
+      console.error("Payment verification error during registration", String(error?.message || error));
+      return res.status(500).json({
+        error: "Payment verification failed. Please try again or contact support.",
+      });
+    }
+  }
+
+  const preRide = Array.isArray(documents.preRidePhotos) ? documents.preRidePhotos : [];
+  if (preRide.length === 0) {
+    return res.status(400).json({ error: "preRidePhotos required (at least 1 pre-ride vehicle photo)" });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query("begin");
+
+    const availability = await getActiveAvailability({ client });
+    const requestedVehicleId = normalizeIdForCompare(rental.bike_id || rental.bikeId || "");
+    const requestedVehicleNumber = normalizeIdForCompare(
+      rental.vehicle_number || rental.vehicleNumber || rental.bikeId || ""
+    );
+    const requestedBatteryId = normalizeIdForCompare(rental.battery_id || rental.batteryId || "");
+
+    if (requestedVehicleId && availability.unavailableVehicleIdSet.has(requestedVehicleId)) {
+      await client.query("rollback");
+      return res.status(409).json({ error: "Selected vehicle is unavailable (already in an active rental)." });
+    }
+    if (
+      requestedVehicleNumber &&
+      availability.unavailableVehicleNumberSet.has(requestedVehicleNumber)
+    ) {
+      await client.query("rollback");
+      return res.status(409).json({ error: "Selected vehicle is unavailable (already in an active rental)." });
+    }
+    if (
+      requestedBatteryId &&
+      !isSharedDefaultBatteryId(requestedBatteryId) &&
+      availability.unavailableBatteryIdSet.has(requestedBatteryId)
+    ) {
+      await client.query("rollback");
+      return res.status(409).json({ error: "Selected battery is unavailable (already in an active rental)." });
+    }
+
+    // Block existing riders from using the New Rider flow.
+    const existingRiderResult = await client.query(
+      `select id
+       from public.riders
+       where mobile = $1
+          or ($2::text is not null and aadhaar = $2)
+       limit 1`,
+      [mobile, aadhaar || null]
+    );
+    if (existingRiderResult.rows?.length) {
+      await client.query("rollback");
+      return res.status(409).json({
+        error: "Rider already registered. Please use Retain Rider form.",
+      });
+    }
+
+    // Insert rider (no upsert)
+    const riderResult = await client.query(
+      `insert into public.riders (full_name, mobile, aadhaar, dob, gender, permanent_address, temporary_address, reference, status, meta)
+       values ($1,$2,$3,$4,$5,$6,$7,$8,'active',$9)
+       on conflict (mobile) do nothing
+       returning id`,
+      [
+        fullName,
+        mobile,
+        aadhaar || null,
+        rider.dob ? rider.dob : null,
+        rider.gender || null,
+        rider.permanent_address || rider.permanentAddress || null,
+        rider.temporary_address || rider.temporaryAddress || null,
+        rider.reference || null,
+        JSON.stringify(riderMeta),
+      ]
+    );
+
+    if (!riderResult.rows?.length) {
+      await client.query("rollback");
+      return res.status(409).json({
+        error: "Rider already registered. Please use Retain Rider form.",
+      });
+    }
+
+    const riderId = riderResult.rows?.[0]?.id;
+    const riderCode = await ensureRiderCode({ client, riderId });
+
+    const rentalResult = await client.query(
+      `insert into public.rentals
+         (rider_id, start_time, end_time, rental_package, rental_amount, deposit_amount, total_amount, payment_mode, bike_model, bike_id, battery_id, vehicle_number, accessories, other_accessories, meta)
+       values
+         ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+       returning id`,
+      [
+        riderId,
+        rental.start_time,
+        null,
+        rental.rental_package || rental.rentalPackage || null,
+        Number(rental.rental_amount ?? rental.rentalAmount ?? 0),
+        Number(rental.deposit_amount ?? rental.securityDeposit ?? 0),
+        Number(rental.total_amount ?? rental.totalAmount ?? 0),
+        rental.payment_mode || rental.paymentMode || null,
+        rental.bike_model || rental.bikeModel || null,
+        rental.bike_id || rental.bikeId || null,
+        rental.battery_id || rental.batteryId || null,
+        rental.vehicle_number || rental.vehicleNumber || rental.bikeId || null,
+        JSON.stringify(rental.accessories || []),
+        rental.other_accessories || rental.otherAccessories || null,
+        JSON.stringify(rentalMeta),
+      ]
+    );
+
+    const rentalId = rentalResult.rows?.[0]?.id;
+
+    if (rentalId) {
+      const rentalRowQ = await client.query(
+        `select id, start_time, battery_id, vehicle_number
+         from public.rentals
+         where id = $1`,
+        [rentalId]
+      );
+      const rentalRow = rentalRowQ.rows?.[0] || null;
+      if (rentalRow) {
+        await autoCreateBatterySwapForRental({ client, rental: rentalRow });
+      }
+    }
+
+    const normalizeDocumentValue = (value) => {
+      if (!value) return null;
+      if (typeof value === "string") {
+        return { dataUrl: value };
+      }
+      const candidate = value.upload || value;
+      if (
+        candidate &&
+        candidate.url &&
+        candidate.file_name &&
+        candidate.mime_type
+      ) {
+        return {
+          url: candidate.url,
+          file_name: candidate.file_name,
+          mime_type: candidate.mime_type,
+          size_bytes: Number(candidate.size_bytes ?? 0),
+        };
+      }
+      if (candidate && candidate.dataUrl) {
+        return {
+          dataUrl: candidate.dataUrl,
+          fileNameHint: candidate.name,
+        };
+      }
+      return null;
+    };
+
+    const docsToSave = [];
+    const enqueueDocument = (kind, payload, targetRentalId = null) => {
+      const normalized = normalizeDocumentValue(payload);
+      if (!normalized) return;
+      docsToSave.push({
+        kind,
+        riderId,
+        rentalId: targetRentalId === undefined ? null : targetRentalId,
+        ...normalized,
+      });
+    };
+
+    enqueueDocument("rider_photo", documents.riderPhoto);
+    enqueueDocument("government_id", documents.governmentId);
+    enqueueDocument("rider_signature", documents.riderSignature);
+    preRide.forEach((p) => enqueueDocument("pre_ride_photo", p, rentalId));
+
+    for (const doc of docsToSave) {
+      if (doc.url && doc.file_name && doc.mime_type) {
+        await client.query(
+          `insert into public.documents (rider_id, rental_id, kind, file_name, mime_type, size_bytes, url)
+           values ($1,$2,$3,$4,$5,$6,$7)`,
+          [
+            doc.riderId || null,
+            doc.rentalId || null,
+            doc.kind,
+            doc.file_name,
+            doc.mime_type,
+            doc.size_bytes || null,
+            doc.url,
+          ]
+        );
+        continue;
+      }
+
+      if (!doc.dataUrl) continue;
+
+      const saved = await saveDataUrlToUploads({
+        dataUrl: doc.dataUrl,
+        fileNameHint: doc.fileNameHint || `${doc.kind}.jpg`,
+      });
+
+      await client.query(
+        `insert into public.documents (rider_id, rental_id, kind, file_name, mime_type, size_bytes, url)
+         values ($1,$2,$3,$4,$5,$6,$7)`,
+        [
+          doc.riderId || null,
+          doc.rentalId || null,
+          doc.kind,
+          saved.file_name,
+          saved.mime_type,
+          saved.size_bytes,
+          saved.url,
+        ]
+      );
+    }
+
+    await client.query("commit");
+    res.status(201).json({ riderId, rentalId, riderCode });
+  } catch (error) {
+    await client.query("rollback");
+    res.status(500).json({ error: String(error?.message || error) });
+  } finally {
+    client.release();
+  }
+});
+
+// ------------------------------
+// Analytics APIs (replace Supabase views/channels)
+// ------------------------------
+
+app.get("/api/analytics/summary", async (_req, res) => {
+  try {
+    const [totalQ, activeQ, suspendedQ, ridesQ, zonesQ] = await Promise.all([
+      pool.query(`select count(*)::int as count from public.riders`),
+      pool.query(`select count(*)::int as count from public.riders where status = 'active'`),
+      pool.query(`select count(*)::int as count from public.riders where status = 'suspended'`),
+      pool.query(`select count(*)::int as count from public.rentals`),
+      pool.query(
+        `select coalesce(meta->>'zone','') as zone_raw, count(*)::int as value
+         from public.rentals
+         group by 1`
+      ),
+    ]);
+
+    const grouped = {};
+    (zonesQ.rows || []).forEach((r) => {
+      const z = normalizeZone(r.zone_raw);
+      if (!z) return;
+      grouped[z] = (grouped[z] || 0) + Number(r.value || 0);
+    });
+
+    const zoneStats = Object.entries(grouped).map(([zone, value]) => ({ zone, value }));
+
+    res.json({
+      totalRiders: totalQ.rows?.[0]?.count || 0,
+      activeRiders: activeQ.rows?.[0]?.count || 0,
+      suspendedRiders: suspendedQ.rows?.[0]?.count || 0,
+      totalRides: ridesQ.rows?.[0]?.count || 0,
+      zoneStats,
+    });
+  } catch (error) {
+    res.status(500).json({ error: String(error?.message || error) });
+  }
+});
+
+app.get("/api/analytics/daily-riders", async (req, res) => {
+  const days = Math.min(90, Math.max(1, Number(req.query.days || 14)));
+  const zone = String(req.query.zone || "").trim();
+  const date = req.query.date ? String(req.query.date).slice(0, 10) : "";
+
+  try {
+    const params = [days];
+    const where = [`start_time >= (date_trunc('day', now()) - ($1::int - 1) * interval '1 day')`];
+    const push = (v) => {
+      params.push(v);
+      return `$${params.length}`;
+    };
+
+    if (date) {
+      where.push(`start_time >= ${push(`${date}T00:00:00Z`)}::timestamptz`);
+      where.push(`start_time < ${push(`${date}T00:00:00Z`)}::timestamptz + interval '1 day'`);
+    }
+
+    if (zone) {
+      // Zone stored in rentals.meta.zone
+      where.push(`coalesce(meta->>'zone','') ilike ${push(`%${zone}%`)}`);
+    }
+
+    const { rows } = await pool.query(
+      `select to_char(date_trunc('day', start_time), 'Mon DD') as day,
+              to_char(date_trunc('day', start_time), 'YYYY-MM-DD') as date,
+              count(*)::int as total
+       from public.rentals
+       where ${where.join(" and ")}
+       group by 1,2, date_trunc('day', start_time)
+       order by date_trunc('day', start_time) asc`,
+      params
+    );
+
+    res.json(rows || []);
+  } catch (error) {
+    res.status(500).json({ error: String(error?.message || error) });
+  }
+});
+
+app.get("/api/analytics/daily-earnings", async (req, res) => {
+  const days = Math.min(90, Math.max(1, Number(req.query.days || 14)));
+  const date = req.query.date ? String(req.query.date).slice(0, 10) : "";
+
+  try {
+    const params = [days];
+    const where = [`start_time >= (date_trunc('day', now()) - ($1::int - 1) * interval '1 day')`];
+    const push = (v) => {
+      params.push(v);
+      return `$${params.length}`;
+    };
+
+    if (date) {
+      where.push(`start_time >= ${push(`${date}T00:00:00Z`)}::timestamptz`);
+      where.push(`start_time < ${push(`${date}T00:00:00Z`)}::timestamptz + interval '1 day'`);
+    }
+
+    const { rows } = await pool.query(
+      `select to_char(date_trunc('day', start_time), 'YYYY-MM-DD') as date,
+              coalesce(sum(rental_amount),0)::numeric as amount
+       from public.rentals
+       where ${where.join(" and ")}
+       group by 1, date_trunc('day', start_time)
+       order by date_trunc('day', start_time) asc`,
+      params
+    );
+
+    res.json((rows || []).map((r) => ({ date: r.date, amount: Number(r.amount || 0) })));
+  } catch (error) {
+    res.status(500).json({ error: String(error?.message || error) });
+  }
+});
+
+app.get("/api/analytics/zone-distribution", async (_req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `select coalesce(meta->>'zone','') as zone_raw, count(*)::int as value
+       from public.rentals
+       group by 1`
+    );
+
+    const grouped = {};
+    (rows || []).forEach((r) => {
+      const z = normalizeZone(r.zone_raw);
+      if (!z) return;
+      grouped[z] = (grouped[z] || 0) + Number(r.value || 0);
+    });
+    res.json(Object.entries(grouped).map(([zone, value]) => ({ zone, value })));
+  } catch (error) {
+    res.status(500).json({ error: String(error?.message || error) });
+  }
+});
+
+app.get("/api/analytics/active-zone-counts", async (_req, res) => {
+  const ZONES = [
+    "Gotri",
+    "Manjalpur",
+    "Karelibaug",
+    "Daman",
+    "Aatapi",
+    "Waghodiya",
+    "Ajwa Road",
+    "Chhani",
+    "Anand",
+    "Bengaluru",
+  ];
+  const next = Object.fromEntries(ZONES.map((z) => [z, 0]));
+
+  try {
+    const { rows } = await pool.query(
+      `select coalesce(meta->>'zone','') as zone_raw, count(*)::int as value
+       from public.rentals
+       where not exists (select 1 from public.returns ret where ret.rental_id = public.rentals.id)
+       group by 1`
+    );
+
+    (rows || []).forEach((r) => {
+      const z = normalizeZone(r.zone_raw);
+      if (!z) return;
+      next[z] = (next[z] || 0) + Number(r.value || 0);
+    });
+
+    res.json({ counts: next, zones: ZONES });
+  } catch (error) {
+    res.status(500).json({ error: String(error?.message || error) });
+  }
+});
+
+// Return vehicle: close rental + create returns row + upload return photos
+// Return Vehicle Endpoint
+// Handles vehicle return submission with payment verification for overdue charges
+// Blocks return submission if overdue charges exist and payment is not verified
+app.post("/api/returns/submit", upload.array("photos", 10), async (req, res) => {
+  const rentalId = String(req.body.rentalId || "");
+  const conditionNotes = String(req.body.conditionNotes || "").trim();
+  const feedback = String(req.body.feedback || "").trim();
+  const overdueCharge = Number(req.body.overdueCharge || req.body.overdue_charge || 0);
+  const extraPayment = Number(req.body.extraPayment || req.body.extra_payment || 0);
+  const totalDueAmount = overdueCharge + extraPayment;
+
+  if (!rentalId) return res.status(400).json({ error: "rentalId required" });
+  if (!conditionNotes) return res.status(400).json({ error: "conditionNotes required" });
+
+  const files = Array.isArray(req.files) ? req.files : [];
+  if (files.length === 0) {
+    return res.status(400).json({ error: "At least 1 return photo is required" });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query("begin");
+    const nowIso = new Date().toISOString();
+
+    const rentalQ = await client.query(`select id, rider_id, deposit_amount from public.rentals where id = $1`, [
+      rentalId,
+    ]);
+    const rentalRow = rentalQ.rows?.[0] || null;
+    if (!rentalRow) {
+      await client.query("rollback");
+      return res.status(404).json({ error: "Rental not found" });
+    }
+    const riderId = rentalRow.rider_id;
+    const depositAmount = Number(rentalRow.deposit_amount ?? 0);
+
+    // Payment verification for return rider - check if overdue/extra charges are paid
+    // Only verify payment if there are charges due
+    if (totalDueAmount > 0) {
+      const returnMeta = req.body.meta && typeof req.body.meta === "object" ? req.body.meta : {};
+      const merchantTranId = returnMeta.iciciMerchantTranId || returnMeta.merchantTranId || null;
+      const iciciEnabled = String(process.env.VITE_ICICI_ENABLED || "false")
+        .trim()
+        .replace(/^"+|"+$/g, "")
+        .toLowerCase() === "true";
+
+      if (iciciEnabled && merchantTranId) {
+        try {
+          const { rows } = await pool.query(
+            `select status, amount, transaction_type
+             from public.payment_transactions
+             where merchant_tran_id = $1
+               and transaction_type = 'RETURN_RIDER'
+             limit 1`,
+            [merchantTranId]
+          );
+
+          if (!rows || rows.length === 0) {
+            await client.query("rollback");
+            return res.status(402).json({
+              error: "Payment transaction not found for overdue charges. Please complete payment before returning vehicle.",
+              paymentRequired: true,
+            });
+          }
+
+          const paymentTxn = rows[0];
+          if (paymentTxn.status !== "SUCCESS") {
+            await client.query("rollback");
+            return res.status(402).json({
+              error: `Payment not completed for overdue charges. Current status: ${paymentTxn.status}. Please complete payment before returning vehicle.`,
+              paymentRequired: true,
+              paymentStatus: paymentTxn.status,
+            });
+          }
+
+          // Verify payment amount matches total due amount
+          if (paymentTxn.amount !== totalDueAmount) {
+            await client.query("rollback");
+            return res.status(402).json({
+              error: `Payment amount mismatch. Expected ₹${totalDueAmount}, but payment is ₹${paymentTxn.amount}.`,
+              paymentRequired: true,
+            });
+          }
+        } catch (error) {
+          await client.query("rollback");
+          console.error("Payment verification error during return submission", String(error?.message || error));
+          return res.status(500).json({
+            error: "Payment verification failed. Please try again or contact support.",
+          });
+        }
+      } else if (iciciEnabled && !merchantTranId) {
+        // Payment required but merchant transaction ID not provided
+        await client.query("rollback");
+        return res.status(402).json({
+          error: `Payment required for overdue charges (₹${totalDueAmount}). Please complete payment before returning vehicle.`,
+          paymentRequired: true,
+          amountDue: totalDueAmount,
+        });
+      }
+    }
+
+    await client.query(`update public.rentals set end_time = $1 where id = $2`, [nowIso, rentalId]);
+    const ret = await client.query(
+      `insert into public.returns (rental_id, returned_at, condition_notes)
+       values ($1,$2,$3)
+       returning id`,
+      [rentalId, nowIso, conditionNotes]
+    );
+    const returnId = ret.rows?.[0]?.id;
+
+    if (returnId && feedback) {
+      await client.query(
+        `update public.returns
+         set meta = coalesce(meta,'{}'::jsonb) || jsonb_build_object('feedback', $1::text)
+         where id = $2`,
+        [feedback, returnId]
+      );
+    }
+
+    // Deposit refund: when return is recorded, mark deposit as returned to rider.
+    // We store this as metadata to avoid schema changes.
+    if (depositAmount > 0 && returnId) {
+      await client.query(
+        `update public.rentals
+         set meta = coalesce(meta,'{}'::jsonb) || jsonb_build_object(
+           'deposit_returned', true,
+           'deposit_returned_amount', $1::numeric,
+           'deposit_returned_at', $2::text
+         )
+         where id = $3`,
+        [depositAmount, nowIso, rentalId]
+      );
+
+      await client.query(
+        `update public.returns
+         set meta = coalesce(meta,'{}'::jsonb) || jsonb_build_object(
+           'deposit_returned', true,
+           'deposit_returned_amount', $1::numeric,
+           'deposit_returned_at', $2::text
+         )
+         where id = $3`,
+        [depositAmount, nowIso, returnId]
+      );
+    }
+
+    for (const f of files) {
+      await client.query(
+        `insert into public.documents (rider_id, rental_id, return_id, kind, file_name, mime_type, size_bytes, url)
+         values ($1,$2,$3,'return_photo',$4,$5,$6,$7)`,
+        [riderId, rentalId, returnId, f.filename, f.mimetype, f.size, `/uploads/${f.filename}`]
+      );
+    }
+
+    await client.query("commit");
+    res.status(201).json({ returnId, depositReturnedAmount: depositAmount > 0 ? depositAmount : 0 });
+  } catch (error) {
+    await client.query("rollback");
+    res.status(500).json({ error: String(error?.message || error) });
+  } finally {
+    client.release();
+  }
+});
+
+app.get("/api/rentals/active", async (req, res) => {
+  const mobile = toDigits(req.query.mobile || "", 10);
+  const vehicle = String(req.query.vehicle || "").trim();
+  const riderName = String(req.query.name || "").trim();
+  const battery = String(req.query.battery || req.query.batteryId || "").trim();
+
+  try {
+    const params = [];
+    const where = [
+      `not exists (select 1 from public.returns ret where ret.rental_id = r.id)`,
+    ];
+    const push = (v) => {
+      params.push(v);
+      return `$${params.length}`;
+    };
+
+    if (vehicle) {
+      const vehicleNorm = vehicle.replace(/[^a-z0-9]+/gi, "").toLowerCase();
+      where.push(
+        `regexp_replace(lower(coalesce(vehicle_number,'')),'[^a-z0-9]+','','g') = ${push(vehicleNorm)}`
+      );
+    }
+
+    if (battery) {
+      const batteryNorm = battery.replace(/[^a-z0-9]+/gi, "").toLowerCase();
+      where.push(
+        `regexp_replace(lower(coalesce(
+                (
+                  select s.battery_in
+                  from public.battery_swaps s
+                  where regexp_replace(lower(coalesce(s.vehicle_number,'')),'[^a-z0-9]+','','g') =
+                        regexp_replace(lower(coalesce(r.vehicle_number,'')),'[^a-z0-9]+','','g')
+                    and s.swapped_at >= r.start_time
+                  order by s.swapped_at desc, s.created_at desc
+                  limit 1
+                ),
+                r.battery_id
+              )),'[^a-z0-9]+','','g') = ${push(batteryNorm)}`
+      );
+    }
+    if (riderName) {
+      const namePattern = `%${riderName.toLowerCase()}%`;
+      where.push(`lower(coalesce(rd.full_name,'')) like ${push(namePattern)}`);
+    }
+    if (mobile) {
+      where.push(
+        `rider_id in (
+          select id from public.riders
+          where regexp_replace(coalesce(mobile,''),'\\D','','g') = ${push(mobile)}
+        )`
+      );
+    }
+
+    const { rows } = await pool.query(
+      `select r.*,
+              rd.full_name as rider_full_name,
+              rd.mobile as rider_mobile,
+              coalesce(r.meta->>'expected_end_time','') as expected_end_time,
+              coalesce(r.meta->>'deposit_returned','false')::boolean as deposit_returned,
+              coalesce(r.meta->>'deposit_returned_amount','0')::numeric as deposit_returned_amount,
+              coalesce(r.meta->>'deposit_returned_at','') as deposit_returned_at,
+              coalesce(
+                (
+                  select s.battery_in
+                  from public.battery_swaps s
+                  where regexp_replace(lower(coalesce(s.vehicle_number,'')),'[^a-z0-9]+','','g') =
+                        regexp_replace(lower(coalesce(r.vehicle_number,'')),'[^a-z0-9]+','','g')
+                    and s.swapped_at >= r.start_time
+                  order by s.swapped_at desc, s.created_at desc
+                  limit 1
+                ),
+                r.battery_id
+              ) as current_battery_id
+       from public.rentals r
+       left join public.riders rd on rd.id = r.rider_id
+       where ${where.join(" and ")}
+       order by r.start_time desc
+       limit 1`,
+      params
+    );
+
+    res.json(rows[0] || null);
+  } catch (error) {
+    res.status(500).json({ error: String(error?.message || error) });
+  }
+});
+
+app.get("/api/dashboard/summary", async (_req, res) => {
+  try {
+    const [ridersQ, rentalsQ, activeQ, revenueQ] = await Promise.all([
+      pool.query(`select count(*)::int as count from public.riders`),
+      pool.query(`select count(*)::int as count from public.rentals`),
+      pool.query(
+        `select count(*)::int as count
+         from public.rentals r
+         where not exists (select 1 from public.returns ret where ret.rental_id = r.id)`
+      ),
+      pool.query(`select coalesce(sum(rental_amount),0)::numeric as total from public.rentals`),
+    ]);
+
+    res.json({
+      totalRiders: ridersQ.rows?.[0]?.count || 0,
+      totalRentals: rentalsQ.rows?.[0]?.count || 0,
+      activeRides: activeQ.rows?.[0]?.count || 0,
+      revenue: Number(revenueQ.rows?.[0]?.total || 0),
+    });
+  } catch (error) {
+    res.status(500).json({ error: String(error?.message || error) });
+  }
+});
+
+app.get("/api/dashboard/recent-riders", async (req, res) => {
+  const limit = Math.min(20, Math.max(1, Number(req.query.limit || 3)));
+  try {
+    const { rows } = await pool.query(
+      `select full_name, mobile from public.riders order by created_at desc limit $1`,
+      [limit]
+    );
+    res.json(rows || []);
+  } catch (error) {
+    res.status(500).json({ error: String(error?.message || error) });
+  }
+});
+
+app.get("/api/dashboard/active-rentals", async (req, res) => {
+  const limit = Math.min(50, Math.max(1, Number(req.query.limit || 5)));
+  try {
+    const { rows } = await pool.query(
+      `select r.id, r.start_time, r.vehicle_number, r.rider_id, rd.full_name
+       from public.rentals r
+       left join public.riders rd on rd.id = r.rider_id
+       where not exists (select 1 from public.returns ret where ret.rental_id = r.id)
+       order by r.start_time desc
+       limit $1`,
+      [limit]
+    );
+    res.json(rows || []);
+  } catch (error) {
+    res.status(500).json({ error: String(error?.message || error) });
+  }
+});
+
+app.get("/api/dashboard/recent-returns", async (req, res) => {
+  const limit = Math.min(50, Math.max(1, Number(req.query.limit || 5)));
+  try {
+    const { rows } = await pool.query(
+      `select
+         ret.id as return_id,
+         ret.rental_id,
+         ret.returned_at,
+         coalesce(ret.condition_notes,'') as condition_notes,
+         coalesce(ret.meta->>'feedback','') as feedback,
+         r.bike_id,
+         r.vehicle_number,
+         rd.full_name as rider_full_name,
+         rd.mobile as rider_mobile
+       from public.returns ret
+       left join public.rentals r on r.id = ret.rental_id
+       left join public.riders rd on rd.id = r.rider_id
+       order by ret.created_at desc
+       limit $1`,
+      [limit]
+    );
+    res.json(rows || []);
+  } catch (error) {
+    res.status(500).json({ error: String(error?.message || error) });
+  }
+});
+
+
+// New: Multi-metric dashboard analytics (revenue, rentals, deposit, cash/upi split)
+app.get("/api/dashboard/analytics-months", async (req, res) => {
+  const rangeRaw = String(req.query.range || "").trim().toLowerCase();
+  const range = rangeRaw === "weekly" || rangeRaw === "monthly" ? rangeRaw : "6months";
+
+  const toNumber = (value) => Number(value || 0);
+
+  const monthNameFromKey = (key) => {
+    const [year, month] = String(key || "").split("-").map((x) => Number(x));
+    if (!Number.isFinite(year) || !Number.isFinite(month)) return String(key || "");
+    const d = new Date(Date.UTC(year, Math.max(0, month - 1), 1));
+    return d.toLocaleString("en-US", { month: "short", timeZone: "UTC" });
+  };
+
+  const dayLabelFromKey = (key) => {
+    const [year, month, day] = String(key || "").split("-").map((x) => Number(x));
+    if (!Number.isFinite(year) || !Number.isFinite(month) || !Number.isFinite(day)) {
+      return String(key || "");
+    }
+    return `${String(day).padStart(2, "0")}/${String(month).padStart(2, "0")}`;
+  };
+
+  try {
+    if (range === "6months") {
+      const months = Math.min(12, Math.max(1, Number(req.query.months || 6)));
+
+      const { rows } = await pool.query(
+        `select
+          to_char(date_trunc('month', start_time), 'YYYY-MM') as period_key,
+          count(*)::int as rentals,
+          coalesce(sum(rental_amount),0)::numeric as revenue,
+          coalesce(sum(deposit_amount),0)::numeric as deposit,
+          coalesce(sum(case when lower(payment_mode) = 'cash' then rental_amount else 0 end),0)::numeric as cash,
+          coalesce(sum(case when lower(payment_mode) in ('online', 'upi', 'split') then rental_amount else 0 end),0)::numeric as online
+        from public.rentals
+        where start_time >= (date_trunc('month', now()) - ($1::int - 1) * interval '1 month')
+        group by 1, date_trunc('month', start_time)
+        order by date_trunc('month', start_time) asc`,
+        [months]
+      );
+
+      const byKey = new Map(
+        (rows || []).map((r) => [String(r.period_key || ""), r])
+      );
+
+      const now = new Date();
+      const out = [];
+      for (let i = months - 1; i >= 0; i -= 1) {
+        const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - i, 1));
+        const key = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`;
+        const row = byKey.get(key) || {};
+        const label = monthNameFromKey(key);
+
+        out.push({
+          label,
+          month: label,
+          month_id: key,
+          period_key: key,
+          rentals: toNumber(row.rentals),
+          revenue: toNumber(row.revenue),
+          deposit: toNumber(row.deposit),
+          cash: toNumber(row.cash),
+          online: toNumber(row.online),
+          upi: toNumber(row.online),
+        });
+      }
+
+      return res.json(out);
+    }
+
+    const days = range === "weekly" ? 7 : 30;
+    const { rows } = await pool.query(
+      `select
+        to_char(date_trunc('day', start_time), 'YYYY-MM-DD') as period_key,
+        count(*)::int as rentals,
+        coalesce(sum(rental_amount),0)::numeric as revenue,
+        coalesce(sum(deposit_amount),0)::numeric as deposit,
+        coalesce(sum(case when lower(payment_mode) = 'cash' then rental_amount else 0 end),0)::numeric as cash,
+        coalesce(sum(case when lower(payment_mode) in ('online', 'upi', 'split') then rental_amount else 0 end),0)::numeric as online
+      from public.rentals
+      where start_time >= (date_trunc('day', now()) - ($1::int - 1) * interval '1 day')
+      group by 1, date_trunc('day', start_time)
+      order by date_trunc('day', start_time) asc`,
+      [days]
+    );
+
+    const byKey = new Map(
+      (rows || []).map((r) => [String(r.period_key || ""), r])
+    );
+
+    const now = new Date();
+    const todayUtc = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+    const out = [];
+
+    for (let i = days - 1; i >= 0; i -= 1) {
+      const d = new Date(todayUtc);
+      d.setUTCDate(todayUtc.getUTCDate() - i);
+
+      const key = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(
+        d.getUTCDate()
+      ).padStart(2, "0")}`;
+      const row = byKey.get(key) || {};
+      const label = dayLabelFromKey(key);
+
+      out.push({
+        label,
+        month: label,
+        month_id: key,
+        period_key: key,
+        rentals: toNumber(row.rentals),
+        revenue: toNumber(row.revenue),
+        deposit: toNumber(row.deposit),
+        cash: toNumber(row.cash),
+        online: toNumber(row.online),
+        upi: toNumber(row.online),
+      });
+    }
+
+    return res.json(out);
+  } catch (error) {
+    res.status(500).json({ error: String(error?.message || error) });
+  }
+});
+
+app.get("/api/dashboard/rentals-week", async (_req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `select to_char(start_time, 'Dy') as day,
+              count(*)::int as rentals
+       from public.rentals
+       where start_time >= (now() - interval '6 days')
+       group by 1
+       order by min(start_time) asc`
+    );
+    res.json(
+      (rows || []).map((r) => ({ day: String(r.day || "").trim(), rentals: r.rentals }))
+    );
+  } catch (error) {
+    res.status(500).json({ error: String(error?.message || error) });
+  }
+});
+
+app.get("/api/dashboard/returns-week", async (_req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `select to_char(returned_at, 'Dy') as day,
+              count(*)::int as returns
+       from public.returns
+       where returned_at >= (now() - interval '6 days')
+       group by 1
+       order by min(returned_at) asc`
+    );
+    res.json(
+      (rows || []).map((r) => ({ day: String(r.day || "").trim(), returns: r.returns }))
+    );
+  } catch (error) {
+    res.status(500).json({ error: String(error?.message || error) });
+  }
+});
+
+app.get("/api/dashboard/rentals-by-package", async (req, res) => {
+  const days = Math.min(365, Math.max(1, Number(req.query.days || 30)));
+  try {
+    const { rows } = await pool.query(
+      `select coalesce(nullif(trim(rental_package),''),'unknown') as package,
+              count(*)::int as rentals
+       from public.rentals
+       where start_time >= (now() - ($1::int - 1) * interval '1 day')
+       group by 1
+       order by rentals desc`,
+      [days]
+    );
+    res.json(rows || []);
+  } catch (error) {
+    res.status(500).json({ error: String(error?.message || error) });
+  }
+});
+
+app.get("/api/dashboard/rentals-by-zone", async (req, res) => {
+  const days = Math.min(365, Math.max(1, Number(req.query.days || 30)));
+  try {
+    const { rows } = await pool.query(
+      `select coalesce(meta->>'zone','') as zone_raw,
+              count(*)::int as rentals
+       from public.rentals
+       where start_time >= (now() - ($1::int - 1) * interval '1 day')
+       group by 1`,
+      [days]
+    );
+
+    const grouped = {};
+    (rows || []).forEach((r) => {
+      const z = normalizeZone(r.zone_raw);
+      if (!z) return;
+      grouped[z] = (grouped[z] || 0) + Number(r.rentals || 0);
+    });
+
+    const out = Object.entries(grouped)
+      .map(([zone, rentals]) => ({ zone, rentals }))
+      .sort((a, b) => b.rentals - a.rentals);
+
+    res.json(out);
+  } catch (error) {
+    res.status(500).json({ error: String(error?.message || error) });
+  }
+});
+
+// Admin - Firebase Auth Users
+app.get("/api/admin/users", requireAdmin, async (req, res) => {
+  const limit = Math.min(1000, Math.max(1, Number(req.query.limit || 200)));
+  const pageToken = req.query.pageToken ? String(req.query.pageToken) : undefined;
+
+  try {
+    const list = await admin.auth().listUsers(limit, pageToken);
+    const users = (list.users || []).map((u) => ({
+      uid: u.uid,
+      email: u.email || null,
+      displayName: u.displayName || null,
+      disabled: Boolean(u.disabled),
+      role: u.customClaims?.role || "employee",
+      creationTime: u.metadata?.creationTime || null,
+      lastSignInTime: u.metadata?.lastSignInTime || null,
+    }));
+
+    res.json({ users, nextPageToken: list.pageToken || null });
+  } catch (e) {
+    res.status(500).json({ error: String(e?.message || e) });
+  }
+});
+
+app.post("/api/admin/users", requireAdmin, async (req, res) => {
+  const body = req.body || {};
+  const email = String(body.email || "").trim();
+  const password = String(body.password || "");
+  const displayNameRaw = body.displayName !== undefined ? String(body.displayName).trim() : "";
+  const displayName = displayNameRaw ? displayNameRaw : undefined;
+  const role = body.role === "admin" ? "admin" : "employee";
+
+  if (!email) return res.status(400).json({ error: "email required" });
+  if (!password) return res.status(400).json({ error: "password required" });
+
+  try {
+    const created = await admin.auth().createUser({
+      email,
+      password,
+      displayName: displayName || undefined,
+    });
+
+    await admin.auth().setCustomUserClaims(created.uid, { role });
+
+    res.status(201).json({
+      uid: created.uid,
+      email: created.email || null,
+      displayName: created.displayName || null,
+      disabled: Boolean(created.disabled),
+      role,
+    });
+  } catch (e) {
+    res.status(500).json({ error: String(e?.message || e) });
+  }
+});
+
+app.patch("/api/admin/users/:uid", requireAdmin, async (req, res) => {
+  const uid = String(req.params.uid || "").trim();
+  if (!uid) return res.status(400).json({ error: "uid required" });
+
+  const body = req.body || {};
+  const update = {};
+  if (body.email !== undefined) {
+    const nextEmail = String(body.email || "").trim();
+    if (!nextEmail) return res.status(400).json({ error: "email cannot be empty" });
+    update.email = nextEmail;
+  }
+  if (body.displayName !== undefined) {
+    const nextName = String(body.displayName || "").trim();
+    if (!nextName) return res.status(400).json({ error: "displayName cannot be empty" });
+    update.displayName = nextName;
+  }
+  if (body.disabled !== undefined) update.disabled = Boolean(body.disabled);
+  if (body.password) update.password = String(body.password);
+
+  const hasUpdate = Object.keys(update).length > 0;
+  const role = body.role ? (body.role === "admin" ? "admin" : "employee") : null;
+
+  try {
+    if (hasUpdate) await admin.auth().updateUser(uid, update);
+
+    if (role) {
+      await admin.auth().setCustomUserClaims(uid, { role });
+    }
+
+    const refreshed = await admin.auth().getUser(uid);
+    res.json({
+      uid: refreshed.uid,
+      email: refreshed.email || null,
+      displayName: refreshed.displayName || null,
+      disabled: Boolean(refreshed.disabled),
+      role: refreshed.customClaims?.role || "employee",
+      creationTime: refreshed.metadata?.creationTime || null,
+      lastSignInTime: refreshed.metadata?.lastSignInTime || null,
+    });
+  } catch (e) {
+    res.status(500).json({ error: String(e?.message || e) });
+  }
+});
+
+app.delete("/api/admin/users/:uid", requireAdmin, async (req, res) => {
+  const uid = String(req.params.uid || "").trim();
+  if (!uid) return res.status(400).json({ error: "uid required" });
+
+  const requesterUid = String(req.user?.uid || req.user?.user_id || req.user?.sub || "").trim();
+  if (requesterUid && requesterUid === uid) {
+    return res.status(400).json({ error: "You cannot delete your own user." });
+  }
+
+  try {
+    await admin.auth().deleteUser(uid);
+    return res.status(204).send();
+  } catch (e) {
+    return res.status(500).json({ error: String(e?.message || e) });
+  }
+});
+
+app.get("/api/admin/zones", requireAdmin, async (_req, res) => {
+  const client = await pool.connect();
+  try {
+    const zones = await listZoneManagementRows({ client });
+    res.json(zones);
+  } catch (error) {
+    res.status(500).json({ error: String(error?.message || error) });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/api/admin/zones", requireAdmin, async (req, res) => {
+  const body = req.body || {};
+  const zoneName = String(body.zone_name ?? body.zoneName ?? "").trim();
+  const zoneCode = normalizeZoneCode(body.zone_code ?? body.zoneCode ?? "");
+  const area = cleanLocationName(body.area ?? body.areaName ?? zoneName) || zoneName;
+  const country = cleanLocationName(body.country ?? "India") || "India";
+  const state = cleanLocationName(body.state ?? "") || null;
+  const city = cleanLocationName(body.city ?? "") || null;
+  const radiusKm = parseOptionalZoneNumber(body.radius_km ?? body.radiusKm, {
+    min: 0.1,
+    max: 999,
+    decimals: 2,
+  });
+  const latitude = parseOptionalZoneNumber(body.latitude, { min: -90, max: 90, decimals: 6 });
+  const longitude = parseOptionalZoneNumber(body.longitude, { min: -180, max: 180, decimals: 6 });
+  const colorRaw = body.color === undefined ? "#10B981" : body.color;
+  const colorInput = String(colorRaw || "").trim();
+  if (colorInput && !/^#([0-9a-f]{6})$/i.test(colorInput)) {
+    return res.status(400).json({ error: "Valid hex color required (example: #10B981)" });
+  }
+  const color = normalizeZoneColor(colorInput || "#10B981");
+
+  const isActive = body.is_active === undefined && body.isActive === undefined
+    ? true
+    : Boolean(body.is_active ?? body.isActive);
+
+  const staffCountRaw = body.staff_count ?? body.staffCount;
+  const staffCount = staffCountRaw === undefined
+    ? 0
+    : Math.max(0, Math.floor(Number(staffCountRaw) || 0));
+
+  if (!zoneName) return res.status(400).json({ error: "zoneName required" });
+  if (!zoneCode) return res.status(400).json({ error: "zoneCode required" });
+  if (radiusKm === null) return res.status(400).json({ error: "Valid radiusKm required" });
+
+  const client = await pool.connect();
+  try {
+    await ensureFleetManagementTables({ client });
+
+    const location = await upsertLocationHierarchy({
+      client,
+      country,
+      state,
+      city,
+      area,
+      cityLatitude: latitude,
+      cityLongitude: longitude,
+      areaLatitude: latitude,
+      areaLongitude: longitude,
+    });
+
+    const resolvedLatitude = latitude ?? location.cityLatitude;
+    const resolvedLongitude = longitude ?? location.cityLongitude;
+
+    const dupeQ = await client.query(
+      `select id
+       from public.zone_management
+       where lower(zone_code) = lower($1)
+          or lower(zone_name) = lower($2)
+       limit 1`,
+      [zoneCode, zoneName]
+    );
+    if (dupeQ.rowCount) {
+      return res.status(409).json({ error: "Zone with same code or name already exists" });
+    }
+
+    const inserted = await client.query(
+      `insert into public.zone_management
+         (zone_name, zone_code, country, state, city, area, radius_km, latitude, longitude, color, is_active, staff_count, updated_at)
+       values
+         ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,now())
+       returning id`,
+      [
+        zoneName,
+        zoneCode,
+        location.country,
+        location.state,
+        location.city,
+        area,
+        radiusKm,
+        resolvedLatitude,
+        resolvedLongitude,
+        color,
+        isActive,
+        staffCount,
+      ]
+    );
+
+    const createdId = Number(inserted.rows?.[0]?.id || 0);
+    const zones = await listZoneManagementRows({ client });
+    const created = zones.find((z) => z.id === createdId) || null;
+    return res.status(201).json(created);
+  } catch (error) {
+    return res.status(500).json({ error: String(error?.message || error) });
+  } finally {
+    client.release();
+  }
+});
+
+app.patch("/api/admin/zones/:id", requireAdmin, async (req, res) => {
+  const zoneId = Number(req.params.id || 0);
+  if (!Number.isFinite(zoneId) || zoneId <= 0) {
+    return res.status(400).json({ error: "Valid zone id required" });
+  }
+
+  const body = req.body || {};
+  const set = [];
+  const params = [];
+  const push = (value) => {
+    params.push(value);
+    return `$${params.length}`;
+  };
+
+  if (body.zone_name !== undefined || body.zoneName !== undefined) {
+    const zoneName = String(body.zone_name ?? body.zoneName ?? "").trim();
+    if (!zoneName) return res.status(400).json({ error: "zoneName cannot be empty" });
+    set.push(`zone_name = ${push(zoneName)}`);
+  }
+
+  if (body.zone_code !== undefined || body.zoneCode !== undefined) {
+    const zoneCode = normalizeZoneCode(body.zone_code ?? body.zoneCode ?? "");
+    if (!zoneCode) return res.status(400).json({ error: "zoneCode cannot be empty" });
+    set.push(`zone_code = ${push(zoneCode)}`);
+  }
+
+  if (body.country !== undefined) {
+    const country = cleanLocationName(body.country || "");
+    set.push(`country = ${push(country || "India")}`);
+  }
+
+  if (body.state !== undefined) {
+    const state = cleanLocationName(body.state || "");
+    set.push(`state = ${push(state || null)}`);
+  }
+
+  if (body.city !== undefined) {
+    const city = cleanLocationName(body.city || "");
+    set.push(`city = ${push(city || null)}`);
+  }
+
+  if (body.area !== undefined || body.areaName !== undefined) {
+    const area = cleanLocationName(body.area ?? body.areaName ?? "");
+    set.push(`area = ${push(area || null)}`);
+  }
+
+  if (body.radius_km !== undefined || body.radiusKm !== undefined) {
+    const radiusKm = parseOptionalZoneNumber(body.radius_km ?? body.radiusKm, {
+      min: 0.1,
+      max: 999,
+      decimals: 2,
+    });
+    if (radiusKm === null) return res.status(400).json({ error: "Valid radiusKm required" });
+    set.push(`radius_km = ${push(radiusKm)}`);
+  }
+
+  if (body.latitude !== undefined) {
+    if (body.latitude === null || String(body.latitude).trim() === "") {
+      set.push(`latitude = null`);
+    } else {
+      const latitude = parseOptionalZoneNumber(body.latitude, { min: -90, max: 90, decimals: 6 });
+      if (latitude === null) return res.status(400).json({ error: "Valid latitude required" });
+      set.push(`latitude = ${push(latitude)}`);
+    }
+  }
+
+  if (body.longitude !== undefined) {
+    if (body.longitude === null || String(body.longitude).trim() === "") {
+      set.push(`longitude = null`);
+    } else {
+      const longitude = parseOptionalZoneNumber(body.longitude, { min: -180, max: 180, decimals: 6 });
+      if (longitude === null) return res.status(400).json({ error: "Valid longitude required" });
+      set.push(`longitude = ${push(longitude)}`);
+    }
+  }
+
+  if (body.color !== undefined) {
+    const colorInput = String(body.color || "").trim();
+    if (!/^#([0-9a-f]{6})$/i.test(colorInput)) {
+      return res.status(400).json({ error: "Valid hex color required (example: #10B981)" });
+    }
+    set.push(`color = ${push(normalizeZoneColor(colorInput))}`);
+  }
+
+  if (body.is_active !== undefined || body.isActive !== undefined) {
+    set.push(`is_active = ${push(Boolean(body.is_active ?? body.isActive))}`);
+  }
+
+  if (body.staff_count !== undefined || body.staffCount !== undefined) {
+    const nextStaff = Math.max(0, Math.floor(Number(body.staff_count ?? body.staffCount) || 0));
+    set.push(`staff_count = ${push(nextStaff)}`);
+  }
+
+  if (set.length === 0) return res.json({ ok: true });
+
+  set.push(`updated_at = now()`);
+  params.push(zoneId);
+
+  const client = await pool.connect();
+  try {
+    await ensureFleetManagementTables({ client });
+
+    const updateQ = await client.query(
+      `update public.zone_management
+       set ${set.join(", ")}
+       where id = $${params.length}
+       returning id, country, state, city, area, latitude, longitude`,
+      params
+    );
+
+    if (!updateQ.rowCount) {
+      return res.status(404).json({ error: "Zone not found" });
+    }
+
+    const updatedId = Number(updateQ.rows?.[0]?.id || 0);
+
+    await upsertLocationHierarchy({
+      client,
+      country: updateQ.rows?.[0]?.country,
+      state: updateQ.rows?.[0]?.state,
+      city: updateQ.rows?.[0]?.city,
+      area: updateQ.rows?.[0]?.area,
+      cityLatitude: updateQ.rows?.[0]?.latitude,
+      cityLongitude: updateQ.rows?.[0]?.longitude,
+      areaLatitude: updateQ.rows?.[0]?.latitude,
+      areaLongitude: updateQ.rows?.[0]?.longitude,
+    });
+
+    const zones = await listZoneManagementRows({ client });
+    const updated = zones.find((z) => z.id === updatedId) || null;
+    return res.json(updated);
+  } catch (error) {
+    return res.status(500).json({ error: String(error?.message || error) });
+  } finally {
+    client.release();
+  }
+});
+
+app.delete("/api/admin/zones/:id", requireAdmin, async (req, res) => {
+  const zoneId = Number(req.params.id || 0);
+  if (!Number.isFinite(zoneId) || zoneId <= 0) {
+    return res.status(400).json({ error: "Valid zone id required" });
+  }
+
+  const client = await pool.connect();
+  try {
+    await ensureZoneManagementTable({ client });
+    const q = await client.query(`delete from public.zone_management where id = $1`, [zoneId]);
+    if (!q.rowCount) return res.status(404).json({ error: "Zone not found" });
+    return res.status(204).send();
+  } catch (error) {
+    return res.status(500).json({ error: String(error?.message || error) });
+  } finally {
+    client.release();
+  }
+});
+
+app.get("/api/admin/locations", requireAdmin, async (_req, res) => {
+  const client = await pool.connect();
+  try {
+    const locations = await listLocationMasters({ client });
+    res.json(locations);
+  } catch (error) {
+    res.status(500).json({ error: String(error?.message || error) });
+  } finally {
+    client.release();
+  }
+});
+
+app.get("/api/admin/locations/geocode", requireAdmin, async (req, res) => {
+  const cityName = cleanLocationName(req.query.city_name ?? req.query.cityName ?? "");
+  const countryCodeRaw = String(req.query.country_code ?? req.query.countryCode ?? "").trim();
+  const stateCodeRaw = String(req.query.state_code ?? req.query.stateCode ?? "").trim();
+  const countryCode = countryCodeRaw ? locationCodeFromName(countryCodeRaw, "CTY").slice(0, 8) : "";
+  const stateCode = stateCodeRaw ? locationCodeFromName(stateCodeRaw, "ST").slice(0, 8) : "";
+
+  if (!cityName) return res.status(400).json({ error: "cityName required" });
+
+  const client = await pool.connect();
+  try {
+    await ensureFleetManagementTables({ client });
+
+    let countryName = "";
+    if (countryCode) {
+      const countryQ = await client.query(
+        `select country_name
+         from public.fleet_countries
+         where lower(country_code) = lower($1)
+         limit 1`,
+        [countryCode]
+      );
+      countryName = cleanLocationName(countryQ.rows?.[0]?.country_name || "");
+    }
+
+    let stateName = "";
+    if (countryCode && stateCode) {
+      const stateQ = await client.query(
+        `select state_name
+         from public.fleet_states
+         where lower(country_code) = lower($1)
+           and lower(state_code) = lower($2)
+         limit 1`,
+        [countryCode, stateCode]
+      );
+      stateName = cleanLocationName(stateQ.rows?.[0]?.state_name || "");
+
+      const cityQ = await client.query(
+        `select latitude, longitude
+         from public.fleet_cities
+         where lower(country_code) = lower($1)
+           and lower(state_code) = lower($2)
+           and lower(city_name) = lower($3)
+         limit 1`,
+        [countryCode, stateCode, cityName]
+      );
+
+      const existingLatitude = parseOptionalZoneNumber(cityQ.rows?.[0]?.latitude, {
+        min: -90,
+        max: 90,
+        decimals: 6,
+      });
+      const existingLongitude = parseOptionalZoneNumber(cityQ.rows?.[0]?.longitude, {
+        min: -180,
+        max: 180,
+        decimals: 6,
+      });
+
+      if (existingLatitude !== null && existingLongitude !== null) {
+        return res.json({
+          city_name: cityName,
+          country_code: countryCode,
+          state_code: stateCode,
+          latitude: existingLatitude,
+          longitude: existingLongitude,
+          source: "db",
+        });
+      }
+    }
+
+    const geocoded = await geocodeCityCoordinates({
+      cityName,
+      stateName,
+      countryName,
+    });
+
+    if (!geocoded) {
+      return res.status(404).json({ error: "Unable to fetch coordinates for this city" });
+    }
+
+    return res.json({
+      city_name: cityName,
+      country_code: countryCode || null,
+      state_code: stateCode || null,
+      latitude: geocoded.latitude,
+      longitude: geocoded.longitude,
+      source: "geocoder",
+      display_name: geocoded.display_name || null,
+    });
+  } catch (error) {
+    return res.status(500).json({ error: String(error?.message || error) });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/api/admin/locations/countries", requireAdmin, async (req, res) => {
+  const body = req.body || {};
+  const countryName = cleanLocationName(body.country_name ?? body.countryName ?? body.name ?? "");
+  const countryCodeInput = String(body.country_code ?? body.countryCode ?? "").trim();
+  const countryCode = countryCodeInput
+    ? locationCodeFromName(countryCodeInput, "CTY")
+    : countryName.toLowerCase() === "india"
+      ? "IN"
+      : locationCodeFromName(countryName, "CTY").slice(0, 3);
+  const isActive = body.is_active === undefined && body.isActive === undefined
+    ? true
+    : Boolean(body.is_active ?? body.isActive);
+
+  if (!countryName) return res.status(400).json({ error: "Country name required" });
+
+  const client = await pool.connect();
+  try {
+    await ensureFleetManagementTables({ client });
+
+    await client.query(
+      `insert into public.fleet_countries (country_name, country_code, is_active, updated_at)
+       values ($1,$2,$3,now())
+       on conflict do nothing`,
+      [countryName, countryCode, isActive]
+    );
+
+    const q = await client.query(
+      `select id, country_name, country_code, is_active
+       from public.fleet_countries
+       where lower(country_name) = lower($1)
+          or lower(country_code) = lower($2)
+       order by id asc
+       limit 1`,
+      [countryName, countryCode]
+    );
+
+    return res.status(201).json(q.rows?.[0] || null);
+  } catch (error) {
+    return res.status(500).json({ error: String(error?.message || error) });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/api/admin/locations/states", requireAdmin, async (req, res) => {
+  const body = req.body || {};
+  const countryCodeRaw = String(body.country_code ?? body.countryCode ?? "").trim();
+  const countryCode = countryCodeRaw ? locationCodeFromName(countryCodeRaw, "CTY").slice(0, 8) : "";
+  const stateName = cleanLocationName(body.state_name ?? body.stateName ?? body.name ?? "");
+  const stateCodeInput = String(body.state_code ?? body.stateCode ?? "").trim();
+  const stateCode = stateCodeInput
+    ? locationCodeFromName(stateCodeInput, "ST")
+    : locationCodeFromName(stateName, "ST");
+  const isActive = body.is_active === undefined && body.isActive === undefined
+    ? true
+    : Boolean(body.is_active ?? body.isActive);
+
+  if (!countryCode) return res.status(400).json({ error: "countryCode required" });
+  if (!stateName) return res.status(400).json({ error: "stateName required" });
+
+  const client = await pool.connect();
+  try {
+    await ensureFleetManagementTables({ client });
+
+    const countryQ = await client.query(
+      `select 1
+       from public.fleet_countries
+       where lower(country_code) = lower($1)
+       limit 1`,
+      [countryCode]
+    );
+    if (!countryQ.rowCount) {
+      return res.status(404).json({ error: "Country not found for this countryCode" });
+    }
+
+    await client.query(
+      `insert into public.fleet_states (country_code, state_name, state_code, is_active, updated_at)
+       values ($1,$2,$3,$4,now())
+       on conflict do nothing`,
+      [countryCode, stateName, stateCode, isActive]
+    );
+
+    const q = await client.query(
+      `select id, country_code, state_name, state_code, is_active
+       from public.fleet_states
+       where lower(country_code) = lower($1)
+         and (lower(state_name) = lower($2) or lower(state_code) = lower($3))
+       order by id asc
+       limit 1`,
+      [countryCode, stateName, stateCode]
+    );
+
+    return res.status(201).json(q.rows?.[0] || null);
+  } catch (error) {
+    return res.status(500).json({ error: String(error?.message || error) });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/api/admin/locations/cities", requireAdmin, async (req, res) => {
+  const body = req.body || {};
+  const countryCodeRaw = String(body.country_code ?? body.countryCode ?? "").trim();
+  const stateCodeRaw = String(body.state_code ?? body.stateCode ?? "").trim();
+  const countryCode = countryCodeRaw ? locationCodeFromName(countryCodeRaw, "CTY").slice(0, 8) : "";
+  const stateCode = stateCodeRaw ? locationCodeFromName(stateCodeRaw, "ST").slice(0, 8) : "";
+  const cityName = cleanLocationName(body.city_name ?? body.cityName ?? body.name ?? "");
+  const latitudeRaw = body.latitude ?? body.lat;
+  const longitudeRaw = body.longitude ?? body.lng;
+  const isActive = body.is_active === undefined && body.isActive === undefined
+    ? true
+    : Boolean(body.is_active ?? body.isActive);
+
+  if (!countryCode) return res.status(400).json({ error: "countryCode required" });
+  if (!stateCode) return res.status(400).json({ error: "stateCode required" });
+  if (!cityName) return res.status(400).json({ error: "cityName required" });
+
+  let latitude = null;
+  let longitude = null;
+
+  if (latitudeRaw !== undefined && latitudeRaw !== null && String(latitudeRaw).trim() !== "") {
+    latitude = parseOptionalZoneNumber(latitudeRaw, { min: -90, max: 90, decimals: 6 });
+    if (latitude === null) return res.status(400).json({ error: "Valid latitude required" });
+  }
+
+  if (longitudeRaw !== undefined && longitudeRaw !== null && String(longitudeRaw).trim() !== "") {
+    longitude = parseOptionalZoneNumber(longitudeRaw, { min: -180, max: 180, decimals: 6 });
+    if (longitude === null) return res.status(400).json({ error: "Valid longitude required" });
+  }
+
+  const client = await pool.connect();
+  try {
+    await ensureFleetManagementTables({ client });
+
+    const stateQ = await client.query(
+      `select s.state_name, c.country_name
+       from public.fleet_states s
+       left join public.fleet_countries c on lower(c.country_code) = lower(s.country_code)
+       where lower(s.country_code) = lower($1)
+         and lower(s.state_code) = lower($2)
+       limit 1`,
+      [countryCode, stateCode]
+    );
+    if (!stateQ.rowCount) {
+      return res.status(404).json({ error: "State not found for this countryCode/stateCode" });
+    }
+
+    const stateName = cleanLocationName(stateQ.rows?.[0]?.state_name || "");
+    const countryName = cleanLocationName(stateQ.rows?.[0]?.country_name || "");
+
+    if (latitude === null || longitude === null) {
+      const existingQ = await client.query(
+        `select latitude, longitude
+         from public.fleet_cities
+         where lower(country_code) = lower($1)
+           and lower(state_code) = lower($2)
+           and lower(city_name) = lower($3)
+         limit 1`,
+        [countryCode, stateCode, cityName]
+      );
+
+      const existingLatitude = parseOptionalZoneNumber(existingQ.rows?.[0]?.latitude, {
+        min: -90,
+        max: 90,
+        decimals: 6,
+      });
+      const existingLongitude = parseOptionalZoneNumber(existingQ.rows?.[0]?.longitude, {
+        min: -180,
+        max: 180,
+        decimals: 6,
+      });
+
+      if (latitude === null && existingLatitude !== null) latitude = existingLatitude;
+      if (longitude === null && existingLongitude !== null) longitude = existingLongitude;
+    }
+
+    if (latitude === null || longitude === null) {
+      const geocoded = await geocodeCityCoordinates({ cityName, stateName, countryName });
+      if (geocoded) {
+        if (latitude === null) latitude = geocoded.latitude;
+        if (longitude === null) longitude = geocoded.longitude;
+      }
+    }
+
+    await client.query(
+      `insert into public.fleet_cities
+         (country_code, state_code, city_name, latitude, longitude, is_active, updated_at)
+       values
+         ($1,$2,$3,$4,$5,$6,now())
+       on conflict (country_code, state_code, city_name) do update
+         set latitude = coalesce(excluded.latitude, public.fleet_cities.latitude),
+             longitude = coalesce(excluded.longitude, public.fleet_cities.longitude),
+             is_active = excluded.is_active,
+             updated_at = now()`,
+      [countryCode, stateCode, cityName, latitude, longitude, isActive]
+    );
+
+    const q = await client.query(
+      `select id, country_code, state_code, city_name, latitude, longitude, is_active
+       from public.fleet_cities
+       where lower(country_code) = lower($1)
+         and lower(state_code) = lower($2)
+         and lower(city_name) = lower($3)
+       order by id asc
+       limit 1`,
+      [countryCode, stateCode, cityName]
+    );
+
+    const city = q.rows?.[0] || null;
+    return res.status(201).json(
+      city
+        ? {
+          ...city,
+          latitude: city.latitude === null ? null : Number(city.latitude),
+          longitude: city.longitude === null ? null : Number(city.longitude),
+        }
+        : null
+    );
+  } catch (error) {
+    return res.status(500).json({ error: String(error?.message || error) });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/api/admin/locations/areas", requireAdmin, async (req, res) => {
+  const body = req.body || {};
+  const countryCodeRaw = String(body.country_code ?? body.countryCode ?? "").trim();
+  const stateCodeRaw = String(body.state_code ?? body.stateCode ?? "").trim();
+  const countryCode = countryCodeRaw ? locationCodeFromName(countryCodeRaw, "CTY").slice(0, 8) : "";
+  const stateCode = stateCodeRaw ? locationCodeFromName(stateCodeRaw, "ST").slice(0, 8) : "";
+  const cityName = cleanLocationName(body.city_name ?? body.cityName ?? "");
+  const areaName = cleanLocationName(body.area_name ?? body.areaName ?? body.name ?? "");
+  const latitudeRaw = body.latitude ?? body.lat;
+  const longitudeRaw = body.longitude ?? body.lng;
+  const isActive = body.is_active === undefined && body.isActive === undefined
+    ? true
+    : Boolean(body.is_active ?? body.isActive);
+
+  if (!countryCode) return res.status(400).json({ error: "countryCode required" });
+  if (!stateCode) return res.status(400).json({ error: "stateCode required" });
+  if (!cityName) return res.status(400).json({ error: "cityName required" });
+  if (!areaName) return res.status(400).json({ error: "areaName required" });
+
+  let latitude = null;
+  let longitude = null;
+
+  if (latitudeRaw !== undefined && latitudeRaw !== null && String(latitudeRaw).trim() !== "") {
+    latitude = parseOptionalZoneNumber(latitudeRaw, { min: -90, max: 90, decimals: 6 });
+    if (latitude === null) return res.status(400).json({ error: "Valid latitude required" });
+  }
+
+  if (longitudeRaw !== undefined && longitudeRaw !== null && String(longitudeRaw).trim() !== "") {
+    longitude = parseOptionalZoneNumber(longitudeRaw, { min: -180, max: 180, decimals: 6 });
+    if (longitude === null) return res.status(400).json({ error: "Valid longitude required" });
+  }
+
+  const client = await pool.connect();
+  try {
+    await ensureFleetManagementTables({ client });
+
+    const cityQ = await client.query(
+      `select
+         c.latitude,
+         c.longitude,
+         s.state_name,
+         co.country_name
+       from public.fleet_cities c
+       left join public.fleet_states s
+         on lower(s.country_code) = lower(c.country_code)
+        and lower(s.state_code) = lower(c.state_code)
+       left join public.fleet_countries co
+         on lower(co.country_code) = lower(c.country_code)
+       where lower(c.country_code) = lower($1)
+         and lower(c.state_code) = lower($2)
+         and lower(c.city_name) = lower($3)
+       limit 1`,
+      [countryCode, stateCode, cityName]
+    );
+    if (!cityQ.rowCount) {
+      return res.status(404).json({ error: "City not found for this countryCode/stateCode/cityName" });
+    }
+
+    const cityLatitude = parseOptionalZoneNumber(cityQ.rows?.[0]?.latitude, {
+      min: -90,
+      max: 90,
+      decimals: 6,
+    });
+    const cityLongitude = parseOptionalZoneNumber(cityQ.rows?.[0]?.longitude, {
+      min: -180,
+      max: 180,
+      decimals: 6,
+    });
+    const stateName = cleanLocationName(cityQ.rows?.[0]?.state_name || "");
+    const countryName = cleanLocationName(cityQ.rows?.[0]?.country_name || "");
+
+    if (latitude === null && cityLatitude !== null) latitude = cityLatitude;
+    if (longitude === null && cityLongitude !== null) longitude = cityLongitude;
+
+    if (latitude === null || longitude === null) {
+      const geocoded = await geocodeAreaCoordinates({
+        areaName,
+        cityName,
+        stateName,
+        countryName,
+      });
+      if (geocoded) {
+        if (latitude === null) latitude = geocoded.latitude;
+        if (longitude === null) longitude = geocoded.longitude;
+      }
+    }
+
+    await client.query(
+      `insert into public.fleet_areas
+         (country_code, state_code, city_name, area_name, latitude, longitude, is_active, updated_at)
+       values
+         ($1,$2,$3,$4,$5,$6,$7,now())
+       on conflict (country_code, state_code, city_name, area_name) do update
+         set latitude = coalesce(excluded.latitude, public.fleet_areas.latitude),
+             longitude = coalesce(excluded.longitude, public.fleet_areas.longitude),
+             is_active = excluded.is_active,
+             updated_at = now()`,
+      [countryCode, stateCode, cityName, areaName, latitude, longitude, isActive]
+    );
+
+    const q = await client.query(
+      `select id, country_code, state_code, city_name, area_name, latitude, longitude, is_active
+       from public.fleet_areas
+       where lower(country_code) = lower($1)
+         and lower(state_code) = lower($2)
+         and lower(city_name) = lower($3)
+         and lower(area_name) = lower($4)
+       order by id asc
+       limit 1`,
+      [countryCode, stateCode, cityName, areaName]
+    );
+
+    const area = q.rows?.[0] || null;
+    return res.status(201).json(
+      area
+        ? {
+          ...area,
+          latitude: area.latitude === null ? null : Number(area.latitude),
+          longitude: area.longitude === null ? null : Number(area.longitude),
+        }
+        : null
+    );
+  } catch (error) {
+    return res.status(500).json({ error: String(error?.message || error) });
+  } finally {
+    client.release();
+  }
+});
+
+app.get("/api/admin/fleet/vehicles", requireAdmin, async (_req, res) => {
+  const client = await pool.connect();
+  try {
+    await ensureFleetManagementTables({ client });
+
+    const { rows } = await client.query(
+      `select
+         v.id,
+         v.vehicle_id,
+         v.vehicle_type,
+         v.model,
+         v.zone_id,
+         v.assigned_battery_id,
+         v.status,
+         v.notes,
+         v.created_at,
+         v.updated_at,
+         z.zone_name,
+         z.zone_code,
+         b.battery_id as assigned_battery_code
+       from public.fleet_vehicles v
+       left join public.zone_management z on z.id = v.zone_id
+       left join public.fleet_batteries b on b.id = v.assigned_battery_id
+       order by lower(v.vehicle_id) asc`
+    );
+
+    res.json(
+      (rows || []).map((row) => ({
+        id: Number(row.id),
+        vehicle_id: row.vehicle_id,
+        vehicle_type: row.vehicle_type,
+        model: row.model,
+        zone_id: row.zone_id === null ? null : Number(row.zone_id),
+        zone_name: row.zone_name,
+        zone_code: row.zone_code,
+        assigned_battery_id: row.assigned_battery_id === null ? null : Number(row.assigned_battery_id),
+        assigned_battery_code: row.assigned_battery_code || null,
+        status: normalizeVehicleStatus(row.status),
+        notes: row.notes || "",
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+      }))
+    );
+  } catch (error) {
+    res.status(500).json({ error: String(error?.message || error) });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/api/admin/fleet/vehicles", requireAdmin, async (req, res) => {
+  const body = req.body || {};
+  const vehicleId = normalizeZoneCode(body.vehicle_id ?? body.vehicleId ?? "");
+  const vehicleType = cleanLocationName(body.vehicle_type ?? body.vehicleType ?? "") || null;
+  const model = cleanLocationName(body.model ?? "") || null;
+  const zoneIdRaw = body.zone_id ?? body.zoneId;
+  const zoneId = zoneIdRaw === undefined || zoneIdRaw === null || String(zoneIdRaw).trim() === ""
+    ? null
+    : Number(zoneIdRaw);
+  const assignedBatteryIdRaw = body.assigned_battery_id ?? body.assignedBatteryId;
+  const assignedBatteryId =
+    assignedBatteryIdRaw === undefined ||
+      assignedBatteryIdRaw === null ||
+      String(assignedBatteryIdRaw).trim() === ""
+      ? null
+      : Number(assignedBatteryIdRaw);
+  const status = normalizeVehicleStatus(body.status);
+  const notes = cleanLocationName(body.notes || "") || null;
+
+  if (!vehicleId) return res.status(400).json({ error: "vehicleId required" });
+  if (zoneId !== null && (!Number.isFinite(zoneId) || zoneId <= 0)) {
+    return res.status(400).json({ error: "Valid zoneId required" });
+  }
+  if (assignedBatteryId !== null && (!Number.isFinite(assignedBatteryId) || assignedBatteryId <= 0)) {
+    return res.status(400).json({ error: "Valid assignedBatteryId required" });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query("begin");
+    await ensureFleetManagementTables({ client });
+
+    if (zoneId !== null) {
+      const zoneQ = await client.query(`select 1 from public.zone_management where id = $1 limit 1`, [zoneId]);
+      if (!zoneQ.rowCount) {
+        await client.query("rollback");
+        return res.status(404).json({ error: "Zone not found" });
+      }
+    }
+
+    if (assignedBatteryId !== null) {
+      const batteryQ = await client.query(`select id from public.fleet_batteries where id = $1 limit 1`, [assignedBatteryId]);
+      if (!batteryQ.rowCount) {
+        await client.query("rollback");
+        return res.status(404).json({ error: "Battery not found" });
+      }
+    }
+
+    const insertQ = await client.query(
+      `insert into public.fleet_vehicles
+         (vehicle_id, vehicle_type, model, zone_id, assigned_battery_id, status, notes, updated_at)
+       values
+         ($1,$2,$3,$4,$5,$6,$7,now())
+       returning id`,
+      [vehicleId, vehicleType, model, zoneId, assignedBatteryId, status, notes]
+    );
+
+    const createdId = Number(insertQ.rows?.[0]?.id || 0);
+
+    if (assignedBatteryId !== null) {
+      await client.query(
+        `update public.fleet_batteries
+         set assigned_vehicle_id = $1,
+             zone_id = coalesce($2, zone_id),
+             updated_at = now()
+         where id = $3`,
+        [createdId, zoneId, assignedBatteryId]
+      );
+
+      await client.query(
+        `update public.fleet_batteries
+         set assigned_vehicle_id = null,
+             updated_at = now()
+         where assigned_vehicle_id = $1
+           and id <> $2`,
+        [createdId, assignedBatteryId]
+      );
+    }
+
+    const outQ = await client.query(
+      `select
+         v.id,
+         v.vehicle_id,
+         v.vehicle_type,
+         v.model,
+         v.zone_id,
+         v.assigned_battery_id,
+         v.status,
+         v.notes,
+         v.created_at,
+         v.updated_at,
+         z.zone_name,
+         z.zone_code,
+         b.battery_id as assigned_battery_code
+       from public.fleet_vehicles v
+       left join public.zone_management z on z.id = v.zone_id
+       left join public.fleet_batteries b on b.id = v.assigned_battery_id
+       where v.id = $1
+       limit 1`,
+      [createdId]
+    );
+
+    await client.query("commit");
+    return res.status(201).json(outQ.rows?.[0] || null);
+  } catch (error) {
+    await client.query("rollback");
+    return res.status(500).json({ error: String(error?.message || error) });
+  } finally {
+    client.release();
+  }
+});
+
+app.patch("/api/admin/fleet/vehicles/:id", requireAdmin, async (req, res) => {
+  const id = Number(req.params.id || 0);
+  if (!Number.isFinite(id) || id <= 0) return res.status(400).json({ error: "Valid vehicle id required" });
+
+  const body = req.body || {};
+  const set = [];
+  const params = [];
+  const push = (value) => {
+    params.push(value);
+    return `$${params.length}`;
+  };
+
+  let hasAssignedBatteryChange = false;
+  let assignedBatteryId = null;
+
+  if (body.vehicle_id !== undefined || body.vehicleId !== undefined) {
+    const vehicleId = normalizeZoneCode(body.vehicle_id ?? body.vehicleId ?? "");
+    if (!vehicleId) return res.status(400).json({ error: "vehicleId cannot be empty" });
+    set.push(`vehicle_id = ${push(vehicleId)}`);
+  }
+
+  if (body.vehicle_type !== undefined || body.vehicleType !== undefined) {
+    const vehicleType = cleanLocationName(body.vehicle_type ?? body.vehicleType ?? "");
+    set.push(`vehicle_type = ${push(vehicleType || null)}`);
+  }
+
+  if (body.model !== undefined) {
+    const model = cleanLocationName(body.model || "");
+    set.push(`model = ${push(model || null)}`);
+  }
+
+  if (body.zone_id !== undefined || body.zoneId !== undefined) {
+    const zoneIdRaw = body.zone_id ?? body.zoneId;
+    if (zoneIdRaw === null || String(zoneIdRaw).trim() === "") {
+      set.push(`zone_id = null`);
+    } else {
+      const zoneId = Number(zoneIdRaw);
+      if (!Number.isFinite(zoneId) || zoneId <= 0) {
+        return res.status(400).json({ error: "Valid zoneId required" });
+      }
+      set.push(`zone_id = ${push(zoneId)}`);
+    }
+  }
+
+  if (body.assigned_battery_id !== undefined || body.assignedBatteryId !== undefined) {
+    const batteryRaw = body.assigned_battery_id ?? body.assignedBatteryId;
+    hasAssignedBatteryChange = true;
+    if (batteryRaw === null || String(batteryRaw).trim() === "") {
+      assignedBatteryId = null;
+      set.push(`assigned_battery_id = null`);
+    } else {
+      assignedBatteryId = Number(batteryRaw);
+      if (!Number.isFinite(assignedBatteryId) || assignedBatteryId <= 0) {
+        return res.status(400).json({ error: "Valid assignedBatteryId required" });
+      }
+      set.push(`assigned_battery_id = ${push(assignedBatteryId)}`);
+    }
+  }
+
+  if (body.status !== undefined) {
+    set.push(`status = ${push(normalizeVehicleStatus(body.status))}`);
+  }
+
+  if (body.notes !== undefined) {
+    const notes = cleanLocationName(body.notes || "");
+    set.push(`notes = ${push(notes || null)}`);
+  }
+
+  if (set.length === 0) return res.json({ ok: true });
+
+  set.push(`updated_at = now()`);
+  params.push(id);
+
+  const client = await pool.connect();
+  try {
+    await client.query("begin");
+    await ensureFleetManagementTables({ client });
+
+    const updateQ = await client.query(
+      `update public.fleet_vehicles
+       set ${set.join(", ")}
+       where id = $${params.length}
+       returning id, zone_id, assigned_battery_id`,
+      params
+    );
+
+    if (!updateQ.rowCount) {
+      await client.query("rollback");
+      return res.status(404).json({ error: "Vehicle not found" });
+    }
+
+    const row = updateQ.rows[0];
+    const zoneId = row.zone_id === null ? null : Number(row.zone_id);
+
+    if (hasAssignedBatteryChange) {
+      await client.query(
+        `update public.fleet_batteries
+         set assigned_vehicle_id = null,
+             updated_at = now()
+         where assigned_vehicle_id = $1`,
+        [id]
+      );
+
+      if (assignedBatteryId !== null) {
+        await client.query(
+          `update public.fleet_batteries
+           set assigned_vehicle_id = $1,
+               zone_id = coalesce($2, zone_id),
+               updated_at = now()
+           where id = $3`,
+          [id, zoneId, assignedBatteryId]
+        );
+      }
+    } else if (body.zone_id !== undefined || body.zoneId !== undefined) {
+      await client.query(
+        `update public.fleet_batteries
+         set zone_id = $1,
+             updated_at = now()
+         where id = $2`,
+        [zoneId, row.assigned_battery_id]
+      );
+    }
+
+    const outQ = await client.query(
+      `select
+         v.id,
+         v.vehicle_id,
+         v.vehicle_type,
+         v.model,
+         v.zone_id,
+         v.assigned_battery_id,
+         v.status,
+         v.notes,
+         v.created_at,
+         v.updated_at,
+         z.zone_name,
+         z.zone_code,
+         b.battery_id as assigned_battery_code
+       from public.fleet_vehicles v
+       left join public.zone_management z on z.id = v.zone_id
+       left join public.fleet_batteries b on b.id = v.assigned_battery_id
+       where v.id = $1
+       limit 1`,
+      [id]
+    );
+
+    await client.query("commit");
+    return res.json(outQ.rows?.[0] || null);
+  } catch (error) {
+    await client.query("rollback");
+    return res.status(500).json({ error: String(error?.message || error) });
+  } finally {
+    client.release();
+  }
+});
+
+app.delete("/api/admin/fleet/vehicles/:id", requireAdmin, async (req, res) => {
+  const id = Number(req.params.id || 0);
+  if (!Number.isFinite(id) || id <= 0) return res.status(400).json({ error: "Valid vehicle id required" });
+
+  const client = await pool.connect();
+  try {
+    await client.query("begin");
+    await ensureFleetManagementTables({ client });
+
+    await client.query(
+      `update public.fleet_batteries
+       set assigned_vehicle_id = null,
+           updated_at = now()
+       where assigned_vehicle_id = $1`,
+      [id]
+    );
+
+    const q = await client.query(`delete from public.fleet_vehicles where id = $1`, [id]);
+    if (!q.rowCount) {
+      await client.query("rollback");
+      return res.status(404).json({ error: "Vehicle not found" });
+    }
+
+    await client.query("commit");
+    return res.status(204).send();
+  } catch (error) {
+    await client.query("rollback");
+    return res.status(500).json({ error: String(error?.message || error) });
+  } finally {
+    client.release();
+  }
+});
+
+app.get("/api/admin/fleet/batteries", requireAdmin, async (_req, res) => {
+  const client = await pool.connect();
+  try {
+    await ensureFleetManagementTables({ client });
+
+    const { rows } = await client.query(
+      `select
+         b.id,
+         b.battery_id,
+         b.battery_type,
+         b.zone_id,
+         b.assigned_vehicle_id,
+         b.health_percent,
+         b.status,
+         b.notes,
+         b.created_at,
+         b.updated_at,
+         z.zone_name,
+         z.zone_code,
+         v.vehicle_id as assigned_vehicle_code
+       from public.fleet_batteries b
+       left join public.zone_management z on z.id = b.zone_id
+       left join public.fleet_vehicles v on v.id = b.assigned_vehicle_id
+       order by lower(b.battery_id) asc`
+    );
+
+    res.json(
+      (rows || []).map((row) => ({
+        id: Number(row.id),
+        battery_id: row.battery_id,
+        battery_type: row.battery_type,
+        zone_id: row.zone_id === null ? null : Number(row.zone_id),
+        zone_name: row.zone_name,
+        zone_code: row.zone_code,
+        assigned_vehicle_id: row.assigned_vehicle_id === null ? null : Number(row.assigned_vehicle_id),
+        assigned_vehicle_code: row.assigned_vehicle_code || null,
+        health_percent: Number(row.health_percent || 0),
+        status: normalizeBatteryStatus(row.status),
+        notes: row.notes || "",
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+      }))
+    );
+  } catch (error) {
+    res.status(500).json({ error: String(error?.message || error) });
+  } finally {
+    client.release();
+  }
+});
+
+app.post("/api/admin/fleet/batteries", requireAdmin, async (req, res) => {
+  const body = req.body || {};
+  const batteryId = normalizeZoneCode(body.battery_id ?? body.batteryId ?? "");
+  const batteryType = cleanLocationName(body.battery_type ?? body.batteryType ?? "") || null;
+  const zoneIdRaw = body.zone_id ?? body.zoneId;
+  const zoneId = zoneIdRaw === undefined || zoneIdRaw === null || String(zoneIdRaw).trim() === ""
+    ? null
+    : Number(zoneIdRaw);
+  const assignedVehicleIdRaw = body.assigned_vehicle_id ?? body.assignedVehicleId;
+  const assignedVehicleId =
+    assignedVehicleIdRaw === undefined ||
+      assignedVehicleIdRaw === null ||
+      String(assignedVehicleIdRaw).trim() === ""
+      ? null
+      : Number(assignedVehicleIdRaw);
+  const healthPercentRaw = body.health_percent ?? body.healthPercent;
+  const healthPercent = healthPercentRaw === undefined
+    ? 100
+    : Math.max(0, Math.min(100, Math.round(Number(healthPercentRaw) || 0)));
+  const status = normalizeBatteryStatus(body.status);
+  const notes = cleanLocationName(body.notes || "") || null;
+
+  if (!batteryId) return res.status(400).json({ error: "batteryId required" });
+  if (zoneId !== null && (!Number.isFinite(zoneId) || zoneId <= 0)) {
+    return res.status(400).json({ error: "Valid zoneId required" });
+  }
+  if (assignedVehicleId !== null && (!Number.isFinite(assignedVehicleId) || assignedVehicleId <= 0)) {
+    return res.status(400).json({ error: "Valid assignedVehicleId required" });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query("begin");
+    await ensureFleetManagementTables({ client });
+
+    let vehicleZoneId = null;
+    if (assignedVehicleId !== null) {
+      const vehicleQ = await client.query(
+        `select id, zone_id
+         from public.fleet_vehicles
+         where id = $1
+         limit 1`,
+        [assignedVehicleId]
+      );
+      if (!vehicleQ.rowCount) {
+        await client.query("rollback");
+        return res.status(404).json({ error: "Vehicle not found" });
+      }
+      vehicleZoneId = vehicleQ.rows?.[0]?.zone_id === null ? null : Number(vehicleQ.rows?.[0]?.zone_id);
+    }
+
+    const effectiveZoneId = zoneId !== null ? zoneId : vehicleZoneId;
+
+    const insertQ = await client.query(
+      `insert into public.fleet_batteries
+         (battery_id, battery_type, zone_id, assigned_vehicle_id, health_percent, status, notes, updated_at)
+       values
+         ($1,$2,$3,$4,$5,$6,$7,now())
+       returning id`,
+      [batteryId, batteryType, effectiveZoneId, assignedVehicleId, healthPercent, status, notes]
+    );
+
+    const createdId = Number(insertQ.rows?.[0]?.id || 0);
+
+    if (assignedVehicleId !== null) {
+      await client.query(
+        `update public.fleet_vehicles
+         set assigned_battery_id = $1,
+             zone_id = coalesce($2, zone_id),
+             updated_at = now()
+         where id = $3`,
+        [createdId, effectiveZoneId, assignedVehicleId]
+      );
+    }
+
+    const outQ = await client.query(
+      `select
+         b.id,
+         b.battery_id,
+         b.battery_type,
+         b.zone_id,
+         b.assigned_vehicle_id,
+         b.health_percent,
+         b.status,
+         b.notes,
+         b.created_at,
+         b.updated_at,
+         z.zone_name,
+         z.zone_code,
+         v.vehicle_id as assigned_vehicle_code
+       from public.fleet_batteries b
+       left join public.zone_management z on z.id = b.zone_id
+       left join public.fleet_vehicles v on v.id = b.assigned_vehicle_id
+       where b.id = $1
+       limit 1`,
+      [createdId]
+    );
+
+    await client.query("commit");
+    return res.status(201).json(outQ.rows?.[0] || null);
+  } catch (error) {
+    await client.query("rollback");
+    return res.status(500).json({ error: String(error?.message || error) });
+  } finally {
+    client.release();
+  }
+});
+
+app.patch("/api/admin/fleet/batteries/:id", requireAdmin, async (req, res) => {
+  const id = Number(req.params.id || 0);
+  if (!Number.isFinite(id) || id <= 0) return res.status(400).json({ error: "Valid battery id required" });
+
+  const body = req.body || {};
+  const set = [];
+  const params = [];
+  const push = (value) => {
+    params.push(value);
+    return `$${params.length}`;
+  };
+
+  let hasAssignedVehicleChange = false;
+  let assignedVehicleId = null;
+
+  if (body.battery_id !== undefined || body.batteryId !== undefined) {
+    const batteryId = normalizeZoneCode(body.battery_id ?? body.batteryId ?? "");
+    if (!batteryId) return res.status(400).json({ error: "batteryId cannot be empty" });
+    set.push(`battery_id = ${push(batteryId)}`);
+  }
+
+  if (body.battery_type !== undefined || body.batteryType !== undefined) {
+    const batteryType = cleanLocationName(body.battery_type ?? body.batteryType ?? "");
+    set.push(`battery_type = ${push(batteryType || null)}`);
+  }
+
+  if (body.zone_id !== undefined || body.zoneId !== undefined) {
+    const zoneIdRaw = body.zone_id ?? body.zoneId;
+    if (zoneIdRaw === null || String(zoneIdRaw).trim() === "") {
+      set.push(`zone_id = null`);
+    } else {
+      const zoneId = Number(zoneIdRaw);
+      if (!Number.isFinite(zoneId) || zoneId <= 0) {
+        return res.status(400).json({ error: "Valid zoneId required" });
+      }
+      set.push(`zone_id = ${push(zoneId)}`);
+    }
+  }
+
+  if (body.assigned_vehicle_id !== undefined || body.assignedVehicleId !== undefined) {
+    const vehicleRaw = body.assigned_vehicle_id ?? body.assignedVehicleId;
+    hasAssignedVehicleChange = true;
+    if (vehicleRaw === null || String(vehicleRaw).trim() === "") {
+      assignedVehicleId = null;
+      set.push(`assigned_vehicle_id = null`);
+    } else {
+      assignedVehicleId = Number(vehicleRaw);
+      if (!Number.isFinite(assignedVehicleId) || assignedVehicleId <= 0) {
+        return res.status(400).json({ error: "Valid assignedVehicleId required" });
+      }
+      set.push(`assigned_vehicle_id = ${push(assignedVehicleId)}`);
+    }
+  }
+
+  if (body.health_percent !== undefined || body.healthPercent !== undefined) {
+    const raw = body.health_percent ?? body.healthPercent;
+    const health = Math.max(0, Math.min(100, Math.round(Number(raw) || 0)));
+    set.push(`health_percent = ${push(health)}`);
+  }
+
+  if (body.status !== undefined) {
+    set.push(`status = ${push(normalizeBatteryStatus(body.status))}`);
+  }
+
+  if (body.notes !== undefined) {
+    const notes = cleanLocationName(body.notes || "");
+    set.push(`notes = ${push(notes || null)}`);
+  }
+
+  if (set.length === 0) return res.json({ ok: true });
+
+  set.push(`updated_at = now()`);
+  params.push(id);
+
+  const client = await pool.connect();
+  try {
+    await client.query("begin");
+    await ensureFleetManagementTables({ client });
+
+    const updateQ = await client.query(
+      `update public.fleet_batteries
+       set ${set.join(", ")}
+       where id = $${params.length}
+       returning id, zone_id, assigned_vehicle_id`,
+      params
+    );
+
+    if (!updateQ.rowCount) {
+      await client.query("rollback");
+      return res.status(404).json({ error: "Battery not found" });
+    }
+
+    const row = updateQ.rows[0];
+    const zoneId = row.zone_id === null ? null : Number(row.zone_id);
+
+    if (hasAssignedVehicleChange) {
+      await client.query(
+        `update public.fleet_vehicles
+         set assigned_battery_id = null,
+             updated_at = now()
+         where assigned_battery_id = $1`,
+        [id]
+      );
+
+      if (assignedVehicleId !== null) {
+        await client.query(
+          `update public.fleet_vehicles
+           set assigned_battery_id = $1,
+               zone_id = coalesce($2, zone_id),
+               updated_at = now()
+           where id = $3`,
+          [id, zoneId, assignedVehicleId]
+        );
+      }
+    } else if (body.zone_id !== undefined || body.zoneId !== undefined) {
+      await client.query(
+        `update public.fleet_vehicles
+         set zone_id = $1,
+             updated_at = now()
+         where id = $2`,
+        [zoneId, row.assigned_vehicle_id]
+      );
+    }
+
+    const outQ = await client.query(
+      `select
+         b.id,
+         b.battery_id,
+         b.battery_type,
+         b.zone_id,
+         b.assigned_vehicle_id,
+         b.health_percent,
+         b.status,
+         b.notes,
+         b.created_at,
+         b.updated_at,
+         z.zone_name,
+         z.zone_code,
+         v.vehicle_id as assigned_vehicle_code
+       from public.fleet_batteries b
+       left join public.zone_management z on z.id = b.zone_id
+       left join public.fleet_vehicles v on v.id = b.assigned_vehicle_id
+       where b.id = $1
+       limit 1`,
+      [id]
+    );
+
+    await client.query("commit");
+    return res.json(outQ.rows?.[0] || null);
+  } catch (error) {
+    await client.query("rollback");
+    return res.status(500).json({ error: String(error?.message || error) });
+  } finally {
+    client.release();
+  }
+});
+
+app.delete("/api/admin/fleet/batteries/:id", requireAdmin, async (req, res) => {
+  const id = Number(req.params.id || 0);
+  if (!Number.isFinite(id) || id <= 0) return res.status(400).json({ error: "Valid battery id required" });
+
+  const client = await pool.connect();
+  try {
+    await client.query("begin");
+    await ensureFleetManagementTables({ client });
+
+    await client.query(
+      `update public.fleet_vehicles
+       set assigned_battery_id = null,
+           updated_at = now()
+       where assigned_battery_id = $1`,
+      [id]
+    );
+
+    const q = await client.query(`delete from public.fleet_batteries where id = $1`, [id]);
+    if (!q.rowCount) {
+      await client.query("rollback");
+      return res.status(404).json({ error: "Battery not found" });
+    }
+
+    await client.query("commit");
+    return res.status(204).send();
+  } catch (error) {
+    await client.query("rollback");
+    return res.status(500).json({ error: String(error?.message || error) });
+  } finally {
+    client.release();
+  }
+});
+
+// Drafts
+app.get("/api/drafts", async (req, res) => {
+  const employeeUid = req.query.employeeUid ? String(req.query.employeeUid).trim() : null;
+
+  try {
+    const { rows } = await pool.query(
+      `select id, created_at, updated_at, employee_uid, employee_email, name, phone, step_label, step_path, meta
+       from public.rider_drafts
+       ${employeeUid ? 'where employee_uid = $1' : ''}
+       order by updated_at desc`,
+      employeeUid ? [employeeUid] : []
+    );
+
+    res.json(rows);
+  } catch (error) {
+    res.status(500).json({ error: String(error?.message || error) });
+  }
+});
+
+app.get("/api/drafts/:id", async (req, res) => {
+  const id = req.params.id;
+
+  try {
+    const { rows } = await pool.query(
+      `select *
+       from public.rider_drafts
+       where id = $1
+       limit 1`,
+      [id]
+    );
+
+    res.json(rows[0] || null);
+  } catch (error) {
+    res.status(500).json({ error: String(error?.message || error) });
+  }
+});
+
+app.post("/api/drafts", async (req, res) => {
+  const body = req.body || {};
+
+  if (!body.employee_uid) {
+    return res.status(400).json({ error: "employee_uid required" });
+  }
+
+  try {
+    const { rows } = await pool.query(
+      `insert into public.rider_drafts
+       (employee_uid, employee_email, name, phone, step_label, step_path, meta, data)
+       values ($1,$2,$3,$4,$5,$6,$7::jsonb,$8::jsonb)
+       returning *`,
+      [
+        body.employee_uid,
+        body.employee_email || null,
+        body.name || null,
+        body.phone || null,
+        body.step_label || null,
+        body.step_path || "step-1",
+        JSON.stringify(body.meta || {}),
+        JSON.stringify(body.data || {}),
+      ]
+    );
+
+    res.status(201).json(rows[0]);
+  } catch (error) {
+    res.status(500).json({ error: String(error?.message || error) });
+  }
+});
+
+app.patch("/api/drafts/:id", async (req, res) => {
+  const id = req.params.id;
+  const body = req.body || {};
+
+  try {
+    const { rows } = await pool.query(
+      `update public.rider_drafts
+       set employee_uid = coalesce($1::text, employee_uid),
+         employee_email = coalesce($2::text, employee_email),
+         name = coalesce($3::text, name),
+         phone = coalesce($4::text, phone),
+         step_label = coalesce($5::text, step_label),
+         step_path = coalesce($6::text, step_path),
+           meta = coalesce($7::jsonb, meta),
+           data = coalesce($8::jsonb, data)
+       where id = $9
+       returning *`,
+      [
+        body.employee_uid ?? null,
+        body.employee_email ?? null,
+        body.name ?? null,
+        body.phone ?? null,
+        body.step_label ?? null,
+        body.step_path ?? null,
+        body.meta ? JSON.stringify(body.meta) : null,
+        body.data ? JSON.stringify(body.data) : null,
+        id,
+      ]
+    );
+
+    res.json(rows[0] || null);
+  } catch (error) {
+    res.status(500).json({ error: String(error?.message || error) });
+  }
+});
+
+app.delete("/api/drafts/:id", async (req, res) => {
+  const id = req.params.id;
+
+  try {
+    await pool.query(`delete from public.rider_drafts where id = $1`, [id]);
+    res.status(204).send();
+  } catch (error) {
+    res.status(500).json({ error: String(error?.message || error) });
+  }
+});
+
+// Battery Swaps
+app.get("/api/battery-swaps", async (req, res) => {
+  const employeeUid = req.query.employeeUid ? String(req.query.employeeUid).trim() : null;
+  const includeOrphans = ["1", "true", "yes"].includes(
+    String(req.query.includeOrphans || "").trim().toLowerCase()
+  );
+
+  const where = [];
+  const params = [];
+  const push = (value) => {
+    params.push(value);
+    return `$${params.length}`;
+  };
+
+  if (employeeUid) {
+    const param = push(employeeUid);
+    where.push(`(s.employee_uid = ${param} or (s.employee_uid = 'system' and rr.rental_employee_uid = ${param}))`);
+  }
+
+  if (!includeOrphans) {
+    // Orphan swaps (no matching rider/rental) show as 'N/A' in employee dashboards.
+    // Default to hiding them; admins can still access full data via admin endpoints.
+    where.push(`rr.rider_id is not null`);
+  }
+
+  const whereSql = where.length ? `where ${where.join(" and ")}` : "";
+
+  try {
+    const { rows } = await pool.query(
+      `select s.id, s.created_at, s.swapped_at, s.employee_uid, s.employee_email,
+              s.vehicle_number, s.battery_out, s.battery_in, s.notes,
+              rr.rental_id, rr.rider_id, rr.rider_full_name, rr.rider_mobile
+       from public.battery_swaps s
+       left join lateral (
+         select r.id as rental_id,
+                coalesce(r.meta->>'employee_uid','') as rental_employee_uid,
+                rd.id as rider_id,
+                rd.full_name as rider_full_name,
+                rd.mobile as rider_mobile
+         from public.rentals r
+         left join public.riders rd on rd.id = r.rider_id
+         left join lateral (
+           select max(returned_at) as returned_at
+           from public.returns rt
+           where rt.rental_id = r.id
+         ) ret on true
+         where regexp_replace(lower(coalesce(r.vehicle_number,'')),'[^a-z0-9]+','','g') =
+               regexp_replace(lower(coalesce(s.vehicle_number,'')),'[^a-z0-9]+','','g')
+           and r.start_time <= coalesce(s.swapped_at, s.created_at)
+           and (ret.returned_at is null or ret.returned_at > coalesce(s.swapped_at, s.created_at))
+         order by r.start_time desc
+         limit 1
+       ) rr on true
+       ${whereSql}
+       order by coalesce(s.swapped_at, s.created_at) desc
+       `,
+      params
+    );
+
+    res.json(rows);
+  } catch (error) {
+    res.status(500).json({ error: String(error?.message || error) });
+  }
+});
+
+// Battery Swap Endpoint
+// Handles battery swap submission with payment verification
+// Blocks battery swap if payment is required and not verified
+app.post("/api/battery-swaps", async (req, res) => {
+  const body = req.body || {};
+
+  if (!body.employee_uid) return res.status(400).json({ error: "employee_uid required" });
+  if (!body.vehicle_number) return res.status(400).json({ error: "vehicle_number required" });
+  if (!body.battery_out) return res.status(400).json({ error: "battery_out required" });
+  if (!body.battery_in) return res.status(400).json({ error: "battery_in required" });
+
+  // Payment verification for battery swap
+  // Check if payment is required and verified before allowing battery swap
+  const swapAmount = Number(body.swap_amount || body.swapAmount || 0);
+  const swapMeta = body.meta && typeof body.meta === "object" ? body.meta : {};
+  const merchantTranId = swapMeta.iciciMerchantTranId || swapMeta.merchantTranId || null;
+  const iciciEnabled = String(process.env.VITE_ICICI_ENABLED || "false")
+    .trim()
+    .replace(/^"+|"+$/g, "")
+    .toLowerCase() === "true";
+
+  if (iciciEnabled && swapAmount > 0 && merchantTranId) {
+    try {
+      const { rows } = await pool.query(
+        `select status, amount, transaction_type, battery_swap_id
+         from public.payment_transactions
+         where merchant_tran_id = $1
+           and transaction_type = 'BATTERY_SWAP'
+         limit 1`,
+        [merchantTranId]
+      );
+
+      if (!rows || rows.length === 0) {
+        return res.status(402).json({
+          error: "Payment transaction not found for battery swap. Please complete payment before swapping battery.",
+          paymentRequired: true,
+        });
+      }
+
+      const paymentTxn = rows[0];
+      if (paymentTxn.status !== "SUCCESS") {
+        return res.status(402).json({
+          error: `Payment not completed for battery swap. Current status: ${paymentTxn.status}. Please complete payment before swapping battery.`,
+          paymentRequired: true,
+          paymentStatus: paymentTxn.status,
+        });
+      }
+
+      // Verify payment amount matches swap amount
+      if (paymentTxn.amount !== swapAmount) {
+        return res.status(402).json({
+          error: `Payment amount mismatch. Expected ₹${swapAmount}, but payment is ₹${paymentTxn.amount}.`,
+          paymentRequired: true,
+        });
+      }
+    } catch (error) {
+      console.error("Payment verification error during battery swap", String(error?.message || error));
+      return res.status(500).json({
+        error: "Payment verification failed. Please try again or contact support.",
+      });
+    }
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query("begin");
+
+    const swapTime = body.swapped_at ? new Date(body.swapped_at).toISOString() : new Date().toISOString();
+    const riderMatch = await client.query(
+      `select rd.full_name as rider_full_name
+       from public.rentals r
+       left join public.riders rd on rd.id = r.rider_id
+       left join public.returns ret on ret.rental_id = r.id
+       where regexp_replace(lower(coalesce(r.vehicle_number,'')),'[^a-z0-9]+','','g') =
+             regexp_replace(lower($1::text),'[^a-z0-9]+','','g')
+         and r.start_time <= $2::timestamptz
+         and (ret.id is null or ret.returned_at > $2::timestamptz)
+       order by r.start_time desc
+       limit 1`,
+      [String(body.vehicle_number).trim(), swapTime]
+    );
+    const riderName = String(riderMatch.rows?.[0]?.rider_full_name || "").trim();
+    if (!riderName) {
+      await client.query("rollback");
+      return res.status(409).json({
+        error: "No active rider found for this vehicle at the swap time. Update the vehicle and try again.",
+      });
+    }
+
+    const { rows } = await client.query(
+      `insert into public.battery_swaps
+       (employee_uid, employee_email, vehicle_number, battery_out, battery_in, swapped_at, notes)
+       values ($1,$2,$3,$4,$5,coalesce($6::timestamptz, now()),$7)
+       returning *`,
+      [
+        body.employee_uid,
+        body.employee_email || null,
+        String(body.vehicle_number).trim(),
+        String(body.battery_out).trim(),
+        String(body.battery_in).trim(),
+        body.swapped_at || null,
+        body.notes || null,
+      ]
+    );
+
+    const batterySwapId = rows[0]?.id || null;
+
+    // Link payment transaction to battery swap if payment was made
+    if (batterySwapId && merchantTranId && iciciEnabled && swapAmount > 0) {
+      try {
+        await client.query(
+          `update public.payment_transactions
+           set battery_swap_id = $1,
+               updated_at = now()
+           where merchant_tran_id = $2
+             and transaction_type = 'BATTERY_SWAP'`,
+          [batterySwapId, merchantTranId]
+        );
+      } catch (error) {
+        console.warn("Failed to link payment transaction to battery swap", String(error?.message || error));
+      }
+    }
+
+    let responseRow = rows[0] || null;
+    if (batterySwapId) {
+      const { rows: joinedRows } = await client.query(
+        `select s.id, s.created_at, s.swapped_at, s.employee_uid, s.employee_email,
+                s.vehicle_number, s.battery_out, s.battery_in, s.notes,
+                rr.rental_id, rr.rider_id, rr.rider_full_name, rr.rider_mobile
+         from public.battery_swaps s
+         left join lateral (
+           select r.id as rental_id,
+                  rd.id as rider_id,
+                  rd.full_name as rider_full_name,
+                  rd.mobile as rider_mobile
+           from public.rentals r
+           left join public.riders rd on rd.id = r.rider_id
+           left join lateral (
+             select max(returned_at) as returned_at
+             from public.returns rt
+             where rt.rental_id = r.id
+           ) ret on true
+           where regexp_replace(lower(coalesce(r.vehicle_number,'')),'[^a-z0-9]+','','g') =
+                 regexp_replace(lower(coalesce(s.vehicle_number,'')),'[^a-z0-9]+','','g')
+             and r.start_time <= coalesce(s.swapped_at, s.created_at)
+             and (ret.returned_at is null or ret.returned_at > coalesce(s.swapped_at, s.created_at))
+           order by r.start_time desc
+           limit 1
+         ) rr on true
+         where s.id = $1
+         limit 1`,
+        [batterySwapId]
+      );
+      responseRow = joinedRows?.[0] || responseRow;
+    }
+
+    await client.query("commit");
+    res.status(201).json(responseRow);
+  } catch (error) {
+    await client.query("rollback");
+    res.status(500).json({ error: String(error?.message || error) });
+  } finally {
+    client.release();
+  }
+});
+
+// Usage stats: which battery is used more (based on installs = battery_in count)
+app.get("/api/battery-swaps/usage", async (req, res) => {
+  const employeeUid = req.query.employeeUid ? String(req.query.employeeUid).trim() : null;
+  const params = employeeUid ? [employeeUid] : [];
+  const filter = employeeUid ? "where employee_uid = $1" : "";
+
+  try {
+    const { rows } = await pool.query(
+      `select battery_id,
+              sum(installs)::int as installs,
+              sum(removals)::int as removals
+       from (
+         select battery_in as battery_id, count(*)::int as installs, 0::int as removals
+         from public.battery_swaps
+         ${filter}
+         group by battery_in
+         union all
+        select battery_out as battery_id, 0::int as installs, count(*)::int as removals
+        from public.battery_swaps
+         ${filter}
+         group by battery_out
+       ) x
+       group by battery_id
+       order by (sum(installs)) desc, (sum(removals)) desc`,
+      params
+    );
+
+    res.json(rows);
+  } catch (error) {
+    res.status(500).json({ error: String(error?.message || error) });
+  }
+});
+
+// Admin: manage battery swaps (view/edit/delete)
+app.get("/api/admin/battery-swaps", requireAdmin, async (req, res) => {
+  const limit = Math.min(200, Math.max(1, Number(req.query.limit || 50)));
+  const search = String(req.query.search || "").trim();
+  const start = req.query.start ? String(req.query.start) : "";
+  const end = req.query.end ? String(req.query.end) : "";
+
+  const where = [];
+  const params = [];
+  const push = (v) => {
+    params.push(v);
+    return `$${params.length}`;
+  };
+
+  if (search) {
+    const p = push(`%${search}%`);
+    where.push(
+      `(vehicle_number ilike ${p}
+        or battery_out ilike ${p}
+        or battery_in ilike ${p}
+        or coalesce(employee_email,'') ilike ${p}
+        or employee_uid ilike ${p}
+        or coalesce(rr.rider_full_name,'') ilike ${p}
+        or coalesce(rr.rider_mobile,'') ilike ${p})`
+    );
+  }
+  if (start) where.push(`swapped_at >= ${push(start)}`);
+  if (end) where.push(`swapped_at <= ${push(end)}`);
+
+  const whereSql = where.length ? `where ${where.join(" and ")}` : "";
+
+  try {
+    const { rows } = await pool.query(
+      `select s.id, s.created_at, s.swapped_at, s.employee_uid, s.employee_email,
+              s.vehicle_number, s.battery_out, s.battery_in, s.notes,
+              rr.rental_id, rr.rider_id, rr.rider_full_name, rr.rider_mobile
+       from public.battery_swaps s
+       left join lateral (
+         select r.id as rental_id,
+                rd.id as rider_id,
+                rd.full_name as rider_full_name,
+                rd.mobile as rider_mobile
+         from public.rentals r
+         left join public.riders rd on rd.id = r.rider_id
+         left join public.returns ret on ret.rental_id = r.id
+         where regexp_replace(lower(coalesce(r.vehicle_number,'')),'[^a-z0-9]+','','g') =
+               regexp_replace(lower(coalesce(s.vehicle_number,'')),'[^a-z0-9]+','','g')
+           and r.start_time <= s.swapped_at
+           and (ret.id is null or ret.returned_at > s.swapped_at)
+         order by r.start_time desc
+         limit 1
+       ) rr on true
+       ${whereSql}
+       order by s.swapped_at desc
+       limit ${push(limit)}`,
+      params
+    );
+    res.json(rows || []);
+  } catch (error) {
+    res.status(500).json({ error: String(error?.message || error) });
+  }
+});
+
+app.patch("/api/admin/battery-swaps/:id", requireAdmin, async (req, res) => {
+  const id = String(req.params.id || "").trim();
+  if (!id) return res.status(400).json({ error: "id required" });
+
+  const body = req.body || {};
+  const fields = {
+    vehicle_number: body.vehicle_number,
+    battery_out: body.battery_out,
+    battery_in: body.battery_in,
+    swapped_at: body.swapped_at,
+    notes: body.notes,
+    employee_email: body.employee_email,
+    employee_uid: body.employee_uid,
+  };
+
+  const set = [];
+  const params = [];
+  const push = (v) => {
+    params.push(v);
+    return `$${params.length}`;
+  };
+
+  Object.entries(fields).forEach(([k, v]) => {
+    if (v === undefined) return;
+    if (k === "swapped_at") {
+      set.push(`${k} = ${push(v ? v : null)}::timestamptz`);
+      return;
+    }
+    set.push(`${k} = ${push(v === null ? null : String(v).trim())}`);
+  });
+
+  if (set.length === 0) return res.json({ ok: true });
+  params.push(id);
+
+  try {
+    const { rows } = await pool.query(
+      `update public.battery_swaps
+       set ${set.join(", ")}
+       where id = $${params.length}
+       returning *`,
+      params
+    );
+    res.json(rows[0] || null);
+  } catch (error) {
+    res.status(500).json({ error: String(error?.message || error) });
+  }
+});
+
+app.delete("/api/admin/battery-swaps/:id", requireAdmin, async (req, res) => {
+  const id = String(req.params.id || "").trim();
+  if (!id) return res.status(400).json({ error: "id required" });
+
+  try {
+    await pool.query(`delete from public.battery_swaps where id = $1`, [id]);
+    res.status(204).send();
+  } catch (error) {
+    res.status(500).json({ error: String(error?.message || error) });
+  }
+});
+
+app.post("/api/admin/battery-swaps/bulk-delete", requireAdmin, async (req, res) => {
+  const ids = Array.isArray(req.body?.ids) ? req.body.ids.map((v) => String(v || "").trim()).filter(Boolean) : [];
+  if (ids.length === 0) return res.status(400).json({ error: "ids required" });
+
+  try {
+    const { rowCount } = await pool.query(
+      `delete from public.battery_swaps where id = any($1::uuid[])`,
+      [ids]
+    );
+    res.json({ deleted: rowCount });
+  } catch (error) {
+    res.status(500).json({ error: String(error?.message || error) });
+  }
+});
+
+app.get("/api/admin/battery-swaps/daily", requireAdmin, async (req, res) => {
+  const days = Math.min(90, Math.max(1, Number(req.query.days || 14)));
+  try {
+    const { rows } = await pool.query(
+      `select to_char(date_trunc('day', swapped_at), 'Mon DD') as day,
+              to_char(date_trunc('day', swapped_at), 'YYYY-MM-DD') as date,
+              count(*)::int as swaps
+       from public.battery_swaps
+       where swapped_at >= (date_trunc('day', now()) - ($1::int - 1) * interval '1 day')
+       group by 1,2, date_trunc('day', swapped_at)
+       order by date_trunc('day', swapped_at) asc`,
+      [days]
+    );
+    res.json(rows || []);
+  } catch (error) {
+    res.status(500).json({ error: String(error?.message || error) });
+  }
+});
+
+app.get("/api/admin/battery-swaps/top-batteries", requireAdmin, async (req, res) => {
+  const days = Math.min(365, Math.max(1, Number(req.query.days || 30)));
+  const limit = Math.min(20, Math.max(1, Number(req.query.limit || 6)));
+  try {
+    const { rows } = await pool.query(
+      `select battery_id,
+              sum(installs)::int as installs
+       from (
+         select battery_in as battery_id, count(*)::int as installs
+         from public.battery_swaps
+         where swapped_at >= (now() - ($1::int - 1) * interval '1 day')
+           and coalesce(nullif(trim(battery_in), ''), null) is not null
+         group by battery_in
+       ) x
+       group by battery_id
+       order by installs desc
+       limit $2`,
+      [days, limit]
+    );
+    res.json(rows || []);
+  } catch (error) {
+    res.status(500).json({ error: String(error?.message || error) });
+  }
+});
+
+// Admin: swap frequency per vehicle (with latest battery + matched rider)
+app.get("/api/admin/battery-swaps/top-vehicles", requireAdmin, async (req, res) => {
+  const days = Math.min(365, Math.max(1, Number(req.query.days || 30)));
+  const limit = Math.min(50, Math.max(1, Number(req.query.limit || 10)));
+
+  try {
+    const { rows } = await pool.query(
+      `with agg as (
+         select vehicle_number,
+                count(*)::int as swaps,
+                max(swapped_at) as last_swapped_at
+         from public.battery_swaps
+         where swapped_at >= (now() - ($1::int - 1) * interval '1 day')
+           and coalesce(nullif(trim(vehicle_number), ''), null) is not null
+         group by vehicle_number
+       ), latest as (
+         select distinct on (vehicle_number)
+                vehicle_number,
+                swapped_at,
+                battery_out,
+                battery_in
+         from public.battery_swaps
+         where swapped_at >= (now() - ($1::int - 1) * interval '1 day')
+           and coalesce(nullif(trim(vehicle_number), ''), null) is not null
+         order by vehicle_number, swapped_at desc
+       )
+       select a.vehicle_number,
+              a.swaps,
+              a.last_swapped_at,
+              l.battery_out,
+              l.battery_in,
+              rr.rental_id,
+              rr.rider_id,
+              rr.rider_full_name,
+              rr.rider_mobile
+       from agg a
+       join latest l on l.vehicle_number = a.vehicle_number
+       left join lateral (
+         select r.id as rental_id,
+                rd.id as rider_id,
+                rd.full_name as rider_full_name,
+                rd.mobile as rider_mobile
+         from public.rentals r
+         left join public.riders rd on rd.id = r.rider_id
+         left join public.returns ret on ret.rental_id = r.id
+         where regexp_replace(lower(coalesce(r.vehicle_number,'')),'[^a-z0-9]+','','g') =
+               regexp_replace(lower(coalesce(a.vehicle_number,'')),'[^a-z0-9]+','','g')
+           and r.start_time <= l.swapped_at
+           and (ret.id is null or ret.returned_at > l.swapped_at)
+         order by r.start_time desc
+         limit 1
+       ) rr on true
+       order by a.swaps desc, a.last_swapped_at desc
+       limit $2`,
+      [days, limit]
+    );
+    res.json(rows || []);
+  } catch (error) {
+    res.status(500).json({ error: String(error?.message || error) });
+  }
+});
+
+// Admin: top riders by battery swap count (identify riders swapping frequently)
+app.get("/api/admin/battery-swaps/top-riders", requireAdmin, async (req, res) => {
+  const days = Math.min(365, Math.max(1, Number(req.query.days || 30)));
+  const limit = Math.min(50, Math.max(1, Number(req.query.limit || 10)));
+
+  try {
+    const { rows } = await pool.query(
+      `with mapped as (
+         select s.id,
+                s.swapped_at,
+                rr.rider_id,
+                rr.rider_full_name,
+                rr.rider_mobile
+         from public.battery_swaps s
+         left join lateral (
+           select r.id as rental_id,
+                  rd.id as rider_id,
+                  rd.full_name as rider_full_name,
+                  rd.mobile as rider_mobile
+           from public.rentals r
+           left join public.riders rd on rd.id = r.rider_id
+           left join public.returns ret on ret.rental_id = r.id
+           where regexp_replace(lower(coalesce(r.vehicle_number,'')),'[^a-z0-9]+','','g') =
+                 regexp_replace(lower(coalesce(s.vehicle_number,'')),'[^a-z0-9]+','','g')
+             and r.start_time <= s.swapped_at
+             and (ret.id is null or ret.returned_at > s.swapped_at)
+           order by r.start_time desc
+           limit 1
+         ) rr on true
+         where s.swapped_at >= (now() - ($1::int - 1) * interval '1 day')
+       )
+       select rider_id,
+              max(rider_full_name) as rider_full_name,
+              max(rider_mobile) as rider_mobile,
+              count(*)::int as swaps,
+              max(swapped_at) as last_swapped_at
+       from mapped
+       where rider_id is not null
+       group by rider_id
+       order by swaps desc, last_swapped_at desc
+       limit $2`,
+      [days, limit]
+    );
+    res.json(rows || []);
+  } catch (error) {
+    res.status(500).json({ error: String(error?.message || error) });
+  }
+});
+
+// Admin: latest swap per vehicle (treat battery_in as current battery installed)
+app.get("/api/admin/battery-swaps/latest-by-vehicle", requireAdmin, async (req, res) => {
+  const limit = Math.min(200, Math.max(1, Number(req.query.limit || 20)));
+  const search = String(req.query.search || "").trim();
+
+  const where = [];
+  const params = [];
+  const push = (v) => {
+    params.push(v);
+    return `$${params.length}`;
+  };
+
+  if (search) {
+    const p = push(`%${search}%`);
+    where.push(
+      `(vehicle_number ilike ${p}
+        or battery_out ilike ${p}
+        or battery_in ilike ${p})`
+    );
+  }
+
+  const whereSql = where.length ? `where ${where.join(" and ")}` : "";
+
+  try {
+    const { rows } = await pool.query(
+      `select s.id, s.created_at, s.swapped_at, s.employee_uid, s.employee_email,
+              s.vehicle_number, s.battery_out, s.battery_in, s.notes,
+              rr.rental_id, rr.rider_id, rr.rider_full_name, rr.rider_mobile
+       from (
+         select distinct on (vehicle_number) *
+         from public.battery_swaps
+         ${whereSql}
+         order by vehicle_number, swapped_at desc
+       ) s
+       left join lateral (
+         select r.id as rental_id,
+                rd.id as rider_id,
+                rd.full_name as rider_full_name,
+                rd.mobile as rider_mobile
+         from public.rentals r
+         left join public.riders rd on rd.id = r.rider_id
+         left join public.returns ret on ret.rental_id = r.id
+         where regexp_replace(lower(coalesce(r.vehicle_number,'')),'[^a-z0-9]+','','g') =
+               regexp_replace(lower(coalesce(s.vehicle_number,'')),'[^a-z0-9]+','','g')
+           and r.start_time <= s.swapped_at
+           and (ret.id is null or ret.returned_at > s.swapped_at)
+         order by r.start_time desc
+         limit 1
+       ) rr on true
+       order by s.swapped_at desc
+       limit ${push(limit)}`,
+      params
+    );
+    res.json(rows || []);
+  } catch (error) {
+    res.status(500).json({ error: String(error?.message || error) });
+  }
+});
+
+// Payment Dues
+app.get("/api/payment-dues", async (req, res) => {
+  const employeeUid = req.query.employeeUid ? String(req.query.employeeUid).trim() : null;
+
+  const filters = [];
+  const params = [];
+  const push = (value) => {
+    params.push(value);
+    return `$${params.length}`;
+  };
+
+  if (employeeUid) {
+    filters.push(`employee_uid = ${push(employeeUid)}`);
+  }
+
+  const whereSql = filters.length ? `where ${filters.join(" and ")}` : "";
+
+  try {
+    const { rows } = await pool.query(
+      `select id, created_at, updated_at, employee_uid, employee_email,
+              rider_name, rider_phone, amount_due, due_date, status, notes
+       from public.payment_dues
+       ${whereSql}
+       order by (case when due_date is null then 1 else 0 end), due_date asc, updated_at desc
+       limit 200`,
+      params
+    );
+    res.json(rows);
+  } catch (error) {
+    res.status(500).json({ error: String(error?.message || error) });
+  }
+});
+
+// Overdue Rentals (active rentals past expected_end_time)
+app.get("/api/rentals/overdue", async (req, res) => {
+  const employeeUid = String(req.query.employeeUid || "").trim();
+
+  const where = [
+    "not exists (select 1 from public.returns ret where ret.rental_id = r.id)",
+    "coalesce(nullif(r.meta->>'expected_end_time',''),'') <> ''",
+    // avoid cast errors when expected_end_time is missing/invalid
+    "(r.meta->>'expected_end_time') ~ '^\\d{4}-\\d{2}-\\d{2}T'",
+    "(r.meta->>'expected_end_time')::timestamptz < now()",
+  ];
+  const params = [];
+  const push = (v) => {
+    params.push(v);
+    return `$${params.length}`;
+  };
+
+  if (employeeUid) {
+    where.push(`coalesce(r.meta->>'employee_uid','') = ${push(employeeUid)}`);
+  }
+
+  const whereSql = where.length ? `where ${where.join(" and ")}` : "";
+
+  try {
+    const { rows } = await pool.query(
+      `select
+         r.id as rental_id,
+         r.start_time,
+         r.total_amount,
+         r.payment_mode,
+         r.vehicle_number,
+         r.bike_id,
+         coalesce(r.meta->>'expected_end_time','') as expected_end_time,
+         coalesce(r.meta->>'employee_uid','') as employee_uid,
+         coalesce(r.meta->>'employee_email','') as employee_email,
+         rd.id as rider_id,
+         rd.full_name as rider_name,
+         rd.mobile as rider_phone
+       from public.rentals r
+       left join public.riders rd on rd.id = r.rider_id
+       ${whereSql}
+       order by (r.meta->>'expected_end_time')::timestamptz asc
+       limit 200`,
+      params
+    );
+    res.json(rows || []);
+  } catch (error) {
+    res.status(500).json({ error: String(error?.message || error) });
+  }
+});
+
+app.get("/api/payment-dues/summary", async (req, res) => {
+  const employeeUid = req.query.employeeUid ? String(req.query.employeeUid).trim() : null;
+
+  const params = [];
+  const push = (value) => {
+    params.push(value);
+    return `$${params.length}`;
+  };
+
+  const filters = ["status = 'due'"];
+  if (employeeUid) {
+    filters.unshift(`employee_uid = ${push(employeeUid)}`);
+  }
+
+  const whereSql = filters.length ? `where ${filters.join(" and ")}` : "";
+
+  try {
+    const { rows } = await pool.query(
+      `select
+         count(*)::int as due_count,
+         coalesce(sum(amount_due), 0)::numeric(12,2) as due_total
+       from public.payment_dues
+       ${whereSql}`,
+      params
+    );
+    res.json(rows[0] || { due_count: 0, due_total: "0.00" });
+  } catch (error) {
+    res.status(500).json({ error: String(error?.message || error) });
+  }
+});
+
+async function start() {
+  await ensureDbInitialized();
+
+  const nodeEnv = String(process.env.NODE_ENV || "").trim().toLowerCase();
+  const isProduction = nodeEnv === "production";
+
+  const listenOnce = (p) =>
+    new Promise((resolve, reject) => {
+      const server = app.listen(p, () => resolve({ server, port: p }));
+      server.on("error", reject);
+    });
+
+  if (isProduction) {
+    const result = await listenOnce(port);
+    console.log(`API listening on port ${result.port}`);
+    return;
+  }
+
+  let p = port;
+  // Dev convenience: try a few ports in case a dev server is already running.
+  for (let i = 0; i < 5; i += 1) {
+    try {
+      const result = await listenOnce(p);
+      console.log(`Local API listening on http://localhost:${result.port}`);
+      if (result.port !== port) {
+        console.warn(
+          `Port ${port} was busy; using ${result.port}. Update VITE_API_URL if your frontend needs a fixed port.`
+        );
+      }
+      return;
+    } catch (error) {
+      if (error?.code === "EADDRINUSE") {
+        console.warn(`Port ${p} is in use; trying ${p + 1}...`);
+        p += 1;
+        continue;
+      }
+      throw error;
+    }
+  }
+
+  throw new Error(`Could not bind any port from ${port} to ${port + 4}.`);
+}
+
+start().catch((error) => {
+  console.error("Failed to start API server:", String(error?.message || error));
+  process.exit(1);
+});
